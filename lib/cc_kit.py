@@ -68,7 +68,7 @@ MAT_DEF = {
     "Rubber": ((30, 30, 32), 0.0, 0.9, "rubber", {}),
     "Ceramic": ((206, 202, 192), 0.0, 0.3, "ceramic", {}),
     "Concrete": ((128, 126, 120), 0.0, 0.92, "concrete", {}),
-    "LightEmit": ((226, 236, 255), 0.0, 0.3, "flat", {"emit": 4.0}),
+    "LightEmit": ((255, 214, 160), 0.0, 0.3, "flat", {"emit": 2.5}),  # warm interior light
     "Soil": ((48, 38, 30), 0.0, 0.96, "concrete", {}),
     "DryLeaf": ((104, 88, 54), 0.0, 0.9, "leaf", {}),
     "CarPaint": ((56, 68, 60), 0.2, 0.7, "paint", {}),
