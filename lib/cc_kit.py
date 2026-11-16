@@ -535,6 +535,10 @@ MAT_DEF.update({
     "WarnRed": ((214, 64, 52), 0.1, 0.55, "paint", {}),
     "Paint": ((150, 153, 158), 0.1, 0.62, "paint", {}),
     "NeonOrange": ((255, 136, 32), 0.0, 0.3, "flat", {"emit": 6.0}),
+    "Leaf": ((86, 112, 60), 0.0, 0.7, "leaf", {}),       # healthy foliage, muted green
+    "LeafDark": ((52, 76, 44), 0.0, 0.75, "leaf", {}),   # conifers, hedges, shaded leaves
+    "Grass": ((104, 124, 66), 0.0, 0.85, "leaf", {}),
+    "Flower": ((214, 92, 70), 0.0, 0.6, "plastic", {}),  # warm flower heads
 })
 
 # ------------------------------------------------------------------ assets
