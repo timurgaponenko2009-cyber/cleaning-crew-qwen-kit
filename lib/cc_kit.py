@@ -33,7 +33,7 @@ RES = int(os.environ.get("CC_RES", "1600"))
 MAX_OBJECTS = 40
 TILE = 4.0  # studs per texture repeat
 TEX = int(os.environ.get("CC_TEX", "512"))
-PREFIXES = ("HB_", "OF_", "TL_", "TR_", "FX_", "UI_")
+PREFIXES = ("HB_", "OF_", "TK_", "TR_", "FX_", "UI_", "CC_")
 
 def srgb(r, g, b):
     def lin(c):
