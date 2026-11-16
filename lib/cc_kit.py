@@ -71,6 +71,7 @@ MAT_DEF = {
     "LightEmit": ((255, 214, 160), 0.0, 0.3, "flat", {"emit": 2.5}),  # warm interior light
     "Soil": ((48, 38, 30), 0.0, 0.96, "concrete", {}),
     "DryLeaf": ((104, 88, 54), 0.0, 0.9, "leaf", {}),
+    "Bark": ((86, 64, 48), 0.0, 0.9, "bark", {}),  # tree trunks, roots, boughs: grooves run up the trunk
     "CarPaint": ((56, 68, 60), 0.2, 0.7, "paint", {}),
     "SignPaint": ((176, 140, 40), 0.1, 0.62, "paint", {}),
     "BookRed": ((92, 36, 32), 0.0, 0.8, "fabric", {}),
@@ -166,6 +167,17 @@ def pattern(kind):
         shade -= sc * 0.12
         height = grain * 0.6 + fine * 0.2 - sc * 0.4
         return shade, height, sc * 0.15 + grime * 0.1, grime
+    if kind == "bark":
+        # Deep furrows along the trunk (columns = across, so they run vertically
+        # on the box-projected sides), plates between them, lichen-ish grime.
+        warp = fbm((64, 32, 16)) * 14
+        xx = np.arange(TEX)[None, :] + warp
+        ridge = np.abs(np.sin(xx * 0.11 + fbm((96, 48)) * 6))
+        plates = fbm((12, 6, 3))
+        furrow = ridge ** 0.45
+        shade = 0.62 + 0.3 * furrow + 0.14 * (plates - 0.5)
+        height = furrow * 0.8 + plates * 0.25
+        return shade, height, (1 - furrow) * 0.08 + grime * 0.05, grime * 0.7
     if kind == "metal":
         brushed = norm01(blur(RNG_TEX.standard_normal((TEX, TEX)), 0.6) +
                          np.repeat(blur(RNG_TEX.standard_normal((1, TEX)), 0.8), TEX, 0) * 3)
