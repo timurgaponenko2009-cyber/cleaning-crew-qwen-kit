@@ -265,7 +265,9 @@ def make_textures(name):
     grime = np.asarray(grime, dtype=float) * np.ones((TEX, TEX))
     col = base[None, None, :] * shade[:, :, None]
     if kind not in ("flat",):
-        g = np.clip(grime * 0.55, 0, 0.55)[:, :, None]
+        # Concrete gets light grime: on a 80-stud facade heavy grime reads as camouflage.
+        k = 0.2 if kind == "concrete" else 0.55
+        g = np.clip(grime * k, 0, k)[:, :, None]
         col = col * (1 - g) + GRIME_COL[None, None, :] * g
     col = np.clip(col, 0, 1) ** 2.2  # stored as sRGB below
     alpha = np.full((TEX, TEX, 1), 1.0)
@@ -464,11 +466,18 @@ class Builder:
         self.asset = asset
         self.parts = {}
 
-    def add(self, part, material, src):
+    def add(self, part, material, src, anim=None, pivot=None, axis="Z", speed=None):
+        """anim: "spin" | "swing" | "slide" | "blink" | "sway" -- a moving part.
+        pivot: rotation point / hinge in asset coordinates; axis: "X" | "Y" | "Z"
+        (for slide: the direction); speed: turns per second or a period, optional.
+        A moving part must be its OWN part name: the game moves it as a whole."""
         key = (part, material)
         if key not in self.parts:
             self.parts[key] = bm_new()
         merge(self.parts[key], src)
+        if anim:
+            ANIM.setdefault(self.asset, {})[part] = {
+                "anim": anim, "pivot": list(pivot) if pivot else None, "axis": axis, "speed": speed}
 
     def build(self, coll):
         objs = []
@@ -530,6 +539,8 @@ MAT_DEF.update({
 
 # ------------------------------------------------------------------ assets
 ASSETS = []
+ANIM = {}  # asset -> part -> {anim, pivot, axis, speed}; written to anim.json
+SHOTS = []  # shot() requests, rendered at the end of run()
 
 
 def asset(name):
@@ -856,6 +867,22 @@ def run(pack, preview=True, textures=True):
         order = render_closeups(per_asset, cp)
         lines.append(f"CLOSEUPS {cp} order={','.join(order)}")
     bpy.ops.wm.save_as_mainfile(filepath=os.path.join(OUT, f"{pack}.blend"))
+    if ANIM:
+        import json
+        for a, parts in ANIM.items():
+            for part, info in parts.items():
+                if info["anim"] in ("spin", "swing") and not info["pivot"]:
+                    lines.append(f"CHECK ERROR {a}__{part}: anim {info['anim']} needs a pivot")
+                lines.append(f"ANIM {a}__{part} {info['anim']} pivot={info['pivot']} axis={info['axis']}")
+        with open(os.path.join(OUT, "anim.json"), "w", encoding="utf-8") as fh:
+            json.dump(ANIM, fh, ensure_ascii=False, indent=1)
+    for req in SHOTS:
+        try:
+            lines.append(_render_shot(per_asset, **req))
+        except Exception as e:  # a failed shot never fails the pack
+            import traceback
+            tb = traceback.format_exc().strip().splitlines()
+            lines.append(f"ERROR shot {req.get('name')}: {e!r} at {tb[-3].strip() if len(tb) > 2 else ''}")
     errors = sum(1 for line in lines if line.startswith(("ERROR", "CHECK ERROR")))
     lines.append(f"DONE {pack} assets={len(per_asset)} failed={len(failed)} errors={errors} "
                  f"time={time.time() - T0:.0f}s")
@@ -863,6 +890,152 @@ def run(pack, preview=True, textures=True):
     with open(os.path.join(OUT, "report.txt"), "w", encoding="utf-8") as fh:
         fh.write(text + "\n")
     print(text, flush=True)
+
+
+def shot(name, items, cam, look, size=(1920, 1080), sun=(6, 235), lens=35, ground="Concrete",
+         ground_size=400, haze=0.35):
+    """A rendered scene (loading screen, menu background), drawn at the end of run().
+    items: [(asset, (x, y, z), yaw_degrees), ...]; asset is from this script or
+    "V1a/HB_LampPost" (pack/asset of an already built pack). cam, look: camera and target
+    points (studs). sun: (elevation, azimuth) in degrees. Saved as out/<pack>/<name>.png."""
+    SHOTS.append(dict(name=name, items=items, cam=cam, look=look, size=size, sun=sun, lens=lens,
+                      ground=ground, ground_size=ground_size, haze=haze))
+
+
+def _collection_for(ref):
+    """'V1a/HB_LampPost' -> that asset's collection from out/V1a/V1a.blend (loaded once);
+    'HB_Bench' -> this script's own asset."""
+    if "/" not in ref:
+        coll = bpy.data.collections.get(ref)
+        if coll is None:
+            raise KeyError(f"no asset {ref}")
+        return coll
+    pack, a = ref.split("/", 1)
+    have = bpy.data.collections.get(a)
+    if have:
+        return have
+    path = os.path.join(os.path.dirname(OUT), pack, pack + ".blend")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"pack {pack} not built ({path})")
+    with bpy.data.libraries.load(path, link=False) as (src, dst):
+        if a not in src.collections:
+            raise KeyError(f"pack {pack} has no {a}")
+        dst.collections = [a]
+    return bpy.data.collections[a]
+
+
+def _render_shot(per_asset, name, items, cam, look, size, sun, lens, ground, ground_size, haze):
+    scn = bpy.context.scene
+    scn.render.engine = engine_id()
+    for attr, val in (("taa_render_samples", 64), ("use_raytracing", True), ("use_shadows", True)):
+        try:
+            setattr(scn.eevee, attr, val)
+        except Exception:
+            pass
+    scn.render.resolution_x, scn.render.resolution_y = size
+    try:
+        scn.view_settings.view_transform = "AgX"
+        scn.view_settings.look = "AgX - Medium High Contrast"
+    except Exception:
+        pass
+    # Sources stay at the origin, out of the render; instances place them.
+    sources = [_collection_for(ref) for ref, _, _ in items]
+    for a in per_asset:
+        lc = bpy.context.view_layer.layer_collection.children.get(a)
+        if lc is not None:
+            lc.exclude = True
+    for coll in sources:
+        for ob in coll.all_objects:
+            if ob is not None:
+                ob.hide_render = "__Collider__" in ob.name
+    st = bpy.data.collections.new("_Shot_" + name)
+    scn.collection.children.link(st)
+    world = bpy.data.worlds.new("Sunset")
+    world.use_nodes = True
+    nt = world.node_tree
+    bg = nt.nodes["Background"]
+    try:
+        sky = nt.nodes.new("ShaderNodeTexSky")
+        for kind in ("NISHITA", "MULTIPLE_SCATTERING", "SINGLE_SCATTERING"):
+            try:
+                sky.sky_type = kind
+                break
+            except Exception:
+                continue
+        for attr, val in (("sun_elevation", math.radians(sun[0])), ("sun_rotation", math.radians(sun[1])),
+                          ("air_density", 1.0 + haze * 2), ("dust_density", 1.0 + haze * 6)):
+            try:
+                setattr(sky, attr, val)
+            except Exception:
+                pass
+        nt.links.new(sky.outputs["Color"], bg.inputs["Color"])
+        bg.inputs["Strength"].default_value = 0.22
+    except Exception:
+        bg.inputs["Color"].default_value = (0.9, 0.62, 0.38, 1)
+        bg.inputs["Strength"].default_value = 0.6
+    scn.world = world
+    sd = bpy.data.lights.new("Sun", "SUN")
+    sd.energy, sd.angle, sd.color = 6.5, math.radians(2.5), (1.0, 0.66, 0.38)  # golden hour
+    so = bpy.data.objects.new("Sun", sd)
+    so.rotation_euler = (math.radians(90 - sun[0]), 0, math.radians(sun[1]))
+    st.objects.link(so)
+    gb = bmesh.new()
+    bmesh.ops.create_grid(gb, x_segments=1, y_segments=1, size=ground_size / 2)
+    gme = bpy.data.meshes.new("ShotGround")
+    gb.to_mesh(gme)
+    gb.free()
+    uv = gme.uv_layers.new(name="UVMap")
+    for poly in gme.polygons:
+        for li in poly.loop_indices:
+            co = gme.vertices[gme.loops[li].vertex_index].co
+            uv.data[li].uv = (co.x / TILE, co.y / TILE)
+    gme.materials.append(mat(ground if ground in MAT_DEF else "Concrete"))
+    st.objects.link(bpy.data.objects.new("ShotGround", gme))
+    for (ref, pos, yaw), coll in zip(items, sources):
+        inst = bpy.data.objects.new("I_" + ref.replace("/", "_"), None)
+        inst.instance_type = "COLLECTION"
+        inst.instance_collection = coll
+        inst.location = pos
+        inst.rotation_euler = (0, 0, math.radians(yaw))
+        st.objects.link(inst)
+    # loaded pack collections are not in the scene; instancing works without linking them
+    cd = bpy.data.cameras.new("ShotCam")
+    cd.lens = lens
+    cd.clip_end = 5000
+    camo = bpy.data.objects.new("ShotCam", cd)
+    camo.location = cam
+    camo.rotation_euler = (Vector(look) - Vector(cam)).to_track_quat("-Z", "Y").to_euler()
+    st.objects.link(camo)
+    scn.camera = camo
+    # Hero glass: dark and reflective (the closeup dust pattern reads as a wall from afar).
+    for m in bpy.data.materials:
+        if m.name.split(".")[0] in ("Glass", "DirtyGlass", "DustyGlass", "BoardGlass") and m.use_nodes:
+            b = m.node_tree.nodes.get("Principled BSDF")
+            if b:
+                for link in list(b.inputs["Base Color"].links):
+                    m.node_tree.links.remove(link)
+                b.inputs["Base Color"].default_value = (0.02, 0.03, 0.04, 1)
+                for link in list(b.inputs["Roughness"].links):
+                    m.node_tree.links.remove(link)
+                b.inputs["Roughness"].default_value = 0.06
+                for link in list(b.inputs["Alpha"].links):
+                    m.node_tree.links.remove(link)
+                b.inputs["Alpha"].default_value = 1.0
+                try:
+                    m.surface_render_method = "DITHERED"
+                except Exception:
+                    pass
+    path = os.path.join(OUT, name + ".png")
+    scn.render.filepath = path
+    bpy.ops.render.render(write_still=True)
+    for a in per_asset:
+        lc = bpy.context.view_layer.layer_collection.children.get(a)
+        if lc is not None:
+            lc.exclude = False
+    for ob in list(st.objects):
+        bpy.data.objects.remove(ob)
+    bpy.data.collections.remove(st)
+    return f"SHOT {path} {size[0]}x{size[1]} items={len(items)}"
 
 
 def png(name, rgba):
@@ -881,5 +1054,5 @@ def png(name, rgba):
 
 
 __all__ = ["box", "cyl", "ball", "lathe", "torus", "sweep", "prism", "leg", "T", "euler", "bm_new",
-           "merge", "xf", "Rng", "asset", "run", "png", "fbm", "blur", "norm01", "scratches", "specks",
+           "merge", "xf", "Rng", "asset", "run", "png", "shot", "fbm", "blur", "norm01", "scratches", "specks",
            "MAT_DEF", "Matrix", "Vector", "math", "np"]
