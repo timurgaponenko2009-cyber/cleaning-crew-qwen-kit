@@ -1,0 +1,885 @@
+"""cc_kit — общая библиотека моделей CLEANING CREW для Blender 5.2 (headless).
+
+Скрипт пакета (его пишет Qwen) выглядит так:
+
+    from cc_kit import *
+
+    @asset("HB_Bollard")
+    def bollard(B):
+        B.add("Body", "Concrete", box(bm_new(), (0, 0, 1.15), (0.7, 0.7, 2.3), r=0.06))
+        B.add("Cap", "NeonOrange", cyl(bm_new(), (0, 0, 2.3), (0, 0, 2.4), 0.3))
+
+    run("V1")
+
+Запуск: python run_qwen.py <скрипт.py>  (Blender в фоне, результат в out/<пакет>/).
+run() строит все ассеты, делает PBR-текстуры только для использованных материалов,
+проверяет стандарт, пишет FBX, превью, report.txt и печатает строки REPORT/CHECK.
+Функции геометрии и материалов взяты из art/blender/build_office_kit.py (формат уже в игре).
+"""
+
+import math
+import os
+import time
+
+import bmesh
+import bpy
+import numpy as np
+from mathutils import Euler, Matrix, Vector
+
+T0 = time.time()
+OUT = os.environ.get("CC_OUT", os.path.join(os.getcwd(), "out"))
+TEX_DIR = os.path.join(OUT, "tex")
+RES = int(os.environ.get("CC_RES", "1600"))
+MAX_OBJECTS = 40
+TILE = 4.0  # studs per texture repeat
+TEX = int(os.environ.get("CC_TEX", "512"))
+PREFIXES = ("HB_", "OF_", "TL_", "TR_", "FX_", "UI_")
+
+def srgb(r, g, b):
+    def lin(c):
+        c /= 255
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    return (lin(r), lin(g), lin(b), 1.0)
+
+
+# ------------------------------------------------------------------ materials
+# name: (rgb, metallic, roughness, pattern, extra)
+MAT_DEF = {
+    "WornWood": ((118, 86, 58), 0.0, 0.62, "wood", {}),
+    "DarkWood": ((66, 44, 31), 0.0, 0.5, "wood", {}),
+    "OldMetal": ((104, 108, 112), 0.8, 0.46, "metal", {}),
+    "SteelMetal": ((150, 154, 156), 0.9, 0.34, "metal", {}),
+    "RustMetal": ((104, 64, 42), 0.35, 0.86, "rust", {}),
+    "Chrome": ((196, 200, 204), 1.0, 0.2, "metal", {}),
+    "Brass": ((146, 114, 68), 0.9, 0.36, "metal", {}),
+    "OldPlastic": ((178, 170, 152), 0.0, 0.56, "plastic", {}),  # yellowed office beige
+    "DarkPlastic": ((38, 40, 44), 0.0, 0.5, "plastic", {}),
+    "Laminate": ((168, 162, 150), 0.0, 0.5, "speckle", {}),
+    "Enamel": ((192, 188, 178), 0.0, 0.42, "plastic", {}),
+    "OldLeather": ((58, 38, 29), 0.0, 0.52, "leather", {}),
+    "OfficeFabric": ((56, 62, 72), 0.0, 0.95, "fabric", {}),
+    "DustyGlass": ((140, 156, 160), 0.0, 0.22, "glass", {"alpha": 0.45}),
+    "BoardGlass": ((196, 210, 210), 0.0, 0.16, "glass", {"alpha": 0.35}),
+    "Mirror": ((186, 192, 196), 1.0, 0.1, "glass", {}),
+    "Screen": ((16, 20, 22), 0.0, 0.26, "screen", {}),
+    "Paper": ((210, 202, 182), 0.0, 0.86, "paper", {}),
+    "Cardboard": ((146, 112, 76), 0.0, 0.9, "cardboard", {}),
+    "PackTape": ((160, 128, 84), 0.0, 0.4, "plastic", {}),
+    "Rubber": ((30, 30, 32), 0.0, 0.9, "rubber", {}),
+    "Ceramic": ((206, 202, 192), 0.0, 0.3, "ceramic", {}),
+    "Concrete": ((128, 126, 120), 0.0, 0.92, "concrete", {}),
+    "LightEmit": ((226, 236, 255), 0.0, 0.3, "flat", {"emit": 4.0}),
+    "Soil": ((48, 38, 30), 0.0, 0.96, "concrete", {}),
+    "DryLeaf": ((104, 88, 54), 0.0, 0.9, "leaf", {}),
+    "CarPaint": ((56, 68, 60), 0.2, 0.7, "paint", {}),
+    "SignPaint": ((176, 140, 40), 0.1, 0.62, "paint", {}),
+    "BookRed": ((92, 36, 32), 0.0, 0.8, "fabric", {}),
+    "BookBlue": ((36, 48, 72), 0.0, 0.8, "fabric", {}),
+}
+
+MATS = {}
+
+
+def mat(name):
+    if name in MATS:
+        return MATS[name]
+    rgb, metal, rough, _pattern, extra = MAT_DEF[name]
+    col = srgb(*rgb)
+    m = bpy.data.materials.new(name)
+    m.use_nodes = True
+    m.diffuse_color = col
+    nt = m.node_tree
+    b = nt.nodes.get("Principled BSDF")
+    b.inputs["Base Color"].default_value = col
+    b.inputs["Metallic"].default_value = metal
+    b.inputs["Roughness"].default_value = rough
+    if "emit" in extra:
+        b.inputs["Emission Color"].default_value = col
+        b.inputs["Emission Strength"].default_value = extra["emit"]
+    if "alpha" in extra:
+        b.inputs["Alpha"].default_value = extra["alpha"]
+        try:
+            m.surface_render_method = "BLENDED"
+        except Exception:
+            pass
+    MATS[name] = m
+    return m
+
+
+# ------------------------------------------------------------------ textures
+RNG_TEX = np.random.default_rng(1207)
+
+
+def blur(a, sigma):
+    """Tileable gaussian blur through the FFT."""
+    n = a.shape[0]
+    f = np.fft.fftfreq(n)
+    k = np.exp(-2 * (math.pi * sigma) ** 2 * (f[:, None] ** 2 + f[None, :] ** 2))
+    return np.real(np.fft.ifft2(np.fft.fft2(a) * k))
+
+
+def norm01(a):
+    lo, hi = a.min(), a.max()
+    return (a - lo) / (hi - lo + 1e-9)
+
+
+def fbm(sigmas=(64, 32, 16, 8, 4, 2), weights=None):
+    weights = weights or [1.0 / (i + 1) ** 0.9 for i in range(len(sigmas))]
+    out = np.zeros((TEX, TEX))
+    for s, w in zip(sigmas, weights):
+        out += w * norm01(blur(RNG_TEX.standard_normal((TEX, TEX)), s))
+    return norm01(out)
+
+
+def scratches(count, length=(20, 160), width=1, along=None):
+    img = np.zeros((TEX, TEX))
+    for _ in range(count):
+        x, y = RNG_TEX.uniform(0, TEX, 2)
+        ang = along + RNG_TEX.normal(0, 0.25) if along is not None else RNG_TEX.uniform(0, math.pi)
+        ln = RNG_TEX.uniform(*length)
+        t = np.linspace(0, ln, int(ln * 2))
+        xs = ((x + np.cos(ang) * t) % TEX).astype(int)
+        ys = ((y + np.sin(ang) * t) % TEX).astype(int)
+        val = RNG_TEX.uniform(0.4, 1.0)
+        for dx in range(width):
+            img[ys, (xs + dx) % TEX] = np.maximum(img[ys, (xs + dx) % TEX], val)
+    return img
+
+
+def specks(count, size=1.5):
+    img = np.zeros((TEX, TEX))
+    idx = RNG_TEX.integers(0, TEX, (count, 2))
+    img[idx[:, 0], idx[:, 1]] = RNG_TEX.uniform(0.5, 1.0, count)
+    return np.clip(blur(img, size) * size * 6, 0, 1)
+
+
+def pattern(kind):
+    """Returns (shade multiplier ~1, height 0..1, roughness offset, grime 0..1)."""
+    grime = fbm((96, 48, 24, 12)) ** 2.2
+    if kind == "wood":
+        warp = fbm((48, 24, 12)) * 18
+        yy = np.arange(TEX)[:, None] + warp
+        grain = 0.5 + 0.5 * np.sin(yy * 0.35 + fbm((128, 64)) * 9)
+        fine = fbm((2, 1))
+        shade = 0.78 + 0.22 * grain + 0.08 * (fine - 0.5)
+        sc = scratches(60, (10, 60))
+        shade -= sc * 0.12
+        height = grain * 0.6 + fine * 0.2 - sc * 0.4
+        return shade, height, sc * 0.15 + grime * 0.1, grime
+    if kind == "metal":
+        brushed = norm01(blur(RNG_TEX.standard_normal((TEX, TEX)), 0.6) +
+                         np.repeat(blur(RNG_TEX.standard_normal((1, TEX)), 0.8), TEX, 0) * 3)
+        sc = scratches(140, (20, 200), along=0.0) + scratches(40, (10, 80))
+        sc = np.clip(sc, 0, 1)
+        shade = 0.88 + 0.1 * brushed + 0.12 * sc
+        return shade, brushed * 0.3 - sc * 0.5, -sc * 0.2 + grime * 0.25, grime
+    if kind == "rust":
+        b = fbm((48, 24, 12, 6, 3))
+        pits = specks(1400, 1.2)
+        shade = 0.7 + 0.5 * b - pits * 0.25
+        return shade, b * 0.8 - pits, 0.05 * b, grime * 0.5
+    if kind == "plastic":
+        n = fbm((32, 16, 8, 4))
+        sc = scratches(50, (6, 40))
+        shade = 0.92 + 0.08 * n - sc * 0.08
+        return shade, n * 0.15 - sc * 0.3, grime * 0.2, grime
+    if kind == "speckle":
+        sp = specks(9000, 0.8)
+        n = fbm((24, 8))
+        shade = 0.9 + 0.1 * n - sp * 0.12
+        return shade, sp * 0.2, grime * 0.2, grime
+    if kind == "leather":
+        cells = norm01(blur(RNG_TEX.standard_normal((TEX, TEX)), 3))
+        cracks = np.clip(1 - np.abs(cells - 0.5) * 28, 0, 1)
+        n = fbm((40, 20, 10))
+        shade = 0.82 + 0.25 * n + 0.15 * cracks
+        return shade, cells * 0.5 - cracks * 0.6, cracks * 0.25, grime
+    if kind == "fabric":
+        x = np.arange(TEX)
+        weave = (np.sin(x[:, None] * 1.6) * np.sin(x[None, :] * 1.6)) * 0.5 + 0.5
+        n = fbm((16, 8, 4, 2))
+        shade = 0.85 + 0.15 * n + 0.06 * weave
+        return shade, weave * 0.4 + n * 0.3, 0.0, grime
+    if kind == "glass":
+        dust = fbm((64, 16, 4)) ** 1.6
+        smear = np.clip(scratches(20, (40, 220), width=6) * 0.4, 0, 1)
+        shade = 0.9 + 0.2 * dust
+        return shade, dust * 0.1, dust * 0.35 + smear * 0.2, dust
+    if kind == "screen":
+        dust = fbm((32, 8, 2)) ** 2
+        return 0.9 + 0.5 * dust, dust * 0.05, dust * 0.4, dust
+    if kind == "paper":
+        fib = fbm((3, 1.5, 0.8))
+        stain = fbm((80, 40)) ** 3
+        shade = 0.95 + 0.06 * fib - stain * 0.25
+        return shade, fib * 0.2, stain * 0.1, stain
+    if kind == "cardboard":
+        x = np.arange(TEX)
+        corr = 0.5 + 0.5 * np.sin(x[None, :] * 0.9)
+        fib = fbm((4, 2, 1))
+        shade = 0.88 + 0.06 * corr + 0.08 * fib
+        return shade, corr * 0.3 + fib * 0.2, 0.0, grime
+    if kind == "rubber":
+        n = fbm((8, 4, 2))
+        return 0.9 + 0.12 * n, n * 0.3, 0.0, grime * 0.3
+    if kind == "ceramic":
+        craze = np.clip(1 - np.abs(norm01(blur(RNG_TEX.standard_normal((TEX, TEX)), 6)) - 0.5) * 60, 0, 1)
+        stain = fbm((64, 32)) ** 3
+        shade = 0.97 - craze * 0.08 - stain * 0.18
+        return shade, -craze * 0.3, stain * 0.3, stain
+    if kind == "concrete":
+        n = fbm((48, 16, 6, 2, 1))
+        pits = specks(2600, 0.9)
+        shade = 0.8 + 0.28 * n - pits * 0.2
+        return shade, n * 0.6 - pits * 0.5, 0.0, grime
+    if kind == "leaf":
+        veins = np.clip(1 - np.abs(np.sin(np.arange(TEX)[None, :] * 0.08 + fbm((24,)) * 4)) * 8, 0, 1)
+        n = fbm((16, 8))
+        shade = 0.75 + 0.35 * n - veins * 0.1
+        return shade, veins * 0.3, 0.0, grime
+    if kind == "paint":
+        chips = np.clip((fbm((24, 12, 6, 3)) - 0.72) * 6, 0, 1)
+        n = fbm((32, 12))
+        shade = 0.88 + 0.12 * n
+        return shade, -chips * 0.5 + n * 0.1, chips * 0.3, grime
+    return np.ones((TEX, TEX)), np.zeros((TEX, TEX)), np.zeros((TEX, TEX)), np.zeros((TEX, TEX)) * 0
+
+
+def save_png(path, rgba):
+    img = bpy.data.images.new(os.path.basename(path), TEX, TEX, alpha=True)
+    img.pixels.foreach_set(np.ascontiguousarray(rgba[::-1], dtype=np.float32).ravel())
+    img.filepath_raw = path
+    img.file_format = "PNG"
+    img.save()
+    return img
+
+
+GRIME_COL = np.array([0.18, 0.15, 0.12])
+
+
+def make_textures(name):
+    rgb, metal, rough, kind, extra = MAT_DEF[name]
+    base = np.array(rgb) / 255.0
+    shade, height, rough_off, grime = pattern(kind)
+    shade = np.asarray(shade, dtype=float) * np.ones((TEX, TEX))
+    grime = np.asarray(grime, dtype=float) * np.ones((TEX, TEX))
+    col = base[None, None, :] * shade[:, :, None]
+    if kind not in ("flat",):
+        g = np.clip(grime * 0.55, 0, 0.55)[:, :, None]
+        col = col * (1 - g) + GRIME_COL[None, None, :] * g
+    col = np.clip(col, 0, 1) ** 2.2  # stored as sRGB below
+    alpha = np.full((TEX, TEX, 1), 1.0)
+    if "alpha" in extra:
+        alpha[:] = extra["alpha"]
+        alpha[:, :, 0] = np.clip(extra["alpha"] + grime * 0.35, 0, 1)
+    albedo = np.concatenate([col ** (1 / 2.2), alpha], axis=2)
+    h = np.asarray(height, dtype=float) * np.ones((TEX, TEX))
+    dx = (np.roll(h, -1, 1) - np.roll(h, 1, 1)) * 2.2
+    dy = (np.roll(h, -1, 0) - np.roll(h, 1, 0)) * 2.2
+    n = np.stack([-dx, dy, np.ones_like(h)], axis=2)
+    n /= np.linalg.norm(n, axis=2, keepdims=True)
+    normal = np.concatenate([n * 0.5 + 0.5, np.ones((TEX, TEX, 1))], axis=2)
+    r = np.clip(rough + np.asarray(rough_off) * np.ones((TEX, TEX)) + grime * 0.15, 0.03, 1.0)
+    rough_img = np.concatenate([np.repeat(r[:, :, None], 3, axis=2), np.ones((TEX, TEX, 1))], axis=2)
+    os.makedirs(TEX_DIR, exist_ok=True)
+    out = {}
+    for tag, arr in (("albedo", albedo), ("normal", normal), ("rough", rough_img)):
+        out[tag] = save_png(os.path.join(TEX_DIR, f"{name}_{tag}.png"), arr)
+    return out
+
+
+def hook_textures(name, imgs):
+    m = mat(name)
+    nt = m.node_tree
+    b = nt.nodes.get("Principled BSDF")
+    ta = nt.nodes.new("ShaderNodeTexImage")
+    ta.image = imgs["albedo"]
+    nt.links.new(ta.outputs["Color"], b.inputs["Base Color"])
+    if "alpha" in MAT_DEF[name][4]:
+        nt.links.new(ta.outputs["Alpha"], b.inputs["Alpha"])
+    tr = nt.nodes.new("ShaderNodeTexImage")
+    tr.image = imgs["rough"]
+    tr.image.colorspace_settings.name = "Non-Color"
+    nt.links.new(tr.outputs["Color"], b.inputs["Roughness"])
+    tn = nt.nodes.new("ShaderNodeTexImage")
+    tn.image = imgs["normal"]
+    tn.image.colorspace_settings.name = "Non-Color"
+    nm = nt.nodes.new("ShaderNodeNormalMap")
+    nt.links.new(tn.outputs["Color"], nm.inputs["Color"])
+    nt.links.new(nm.outputs["Normal"], b.inputs["Normal"])
+
+
+# ------------------------------------------------------------------ geometry
+def T(x=0.0, y=0.0, z=0.0):
+    return Matrix.Translation(Vector((x, y, z)))
+
+
+def euler(rx=0, ry=0, rz=0):
+    return Euler((math.radians(rx), math.radians(ry), math.radians(rz))).to_matrix().to_4x4()
+
+
+def bm_new():
+    return bmesh.new()
+
+
+def merge(dst, src):
+    vmap = {v: dst.verts.new(v.co) for v in src.verts}
+    for f in src.faces:
+        try:
+            dst.faces.new([vmap[v] for v in f.verts])
+        except ValueError:
+            pass
+    src.free()
+    return dst
+
+
+def xf(bm, M):
+    bmesh.ops.transform(bm, matrix=M, verts=bm.verts)
+    return bm
+
+
+def box(bm, c, s, r=0.0, seg=2, rot=(0, 0, 0)):
+    tmp = bmesh.new()
+    bmesh.ops.create_cube(tmp, size=1.0, matrix=Matrix.Diagonal((s[0], s[1], s[2], 1.0)))
+    if r > 0:
+        bmesh.ops.bevel(tmp, geom=list(tmp.edges), offset=min(r, min(s) * 0.49), offset_type="OFFSET",
+                        segments=seg, profile=0.5, affect="EDGES", clamp_overlap=True)
+    xf(tmp, T(*c) @ euler(*rot))
+    return merge(bm, tmp)
+
+
+def cyl(bm, a, b, r0, r1=None, segs=16):
+    r1 = r0 if r1 is None else r1
+    a, b = Vector(a), Vector(b)
+    d = b - a
+    rot = d.to_track_quat("Z", "Y").to_matrix().to_4x4()
+    tmp = bmesh.new()
+    bmesh.ops.create_cone(tmp, cap_ends=True, segments=segs, radius1=r0, radius2=r1, depth=d.length,
+                          matrix=Matrix.Translation((a + b) / 2) @ rot)
+    return merge(bm, tmp)
+
+
+def ball(bm, c, r, subd=2, sx=1.0, sy=1.0, sz=1.0):
+    tmp = bmesh.new()
+    bmesh.ops.create_icosphere(tmp, subdivisions=subd, radius=r,
+                               matrix=T(*c) @ Matrix.Diagonal((sx, sy, sz, 1.0)))
+    return merge(bm, tmp)
+
+
+def lathe(bm, prof, segs, m=Matrix(), cap=True):
+    """Revolve an open profile [(r, h)] (bottom to top) about local Z."""
+    tmp = bmesh.new()
+    rings = []
+    for i in range(segs):
+        a = 2 * math.pi * i / segs
+        rings.append([tmp.verts.new(m @ Vector((r * math.cos(a), r * math.sin(a), h))) for r, h in prof])
+    k = len(prof)
+    for i in range(segs):
+        A, B = rings[i], rings[(i + 1) % segs]
+        for j in range(k - 1):
+            q = [A[j], B[j], B[j + 1], A[j + 1]]
+            uniq = []
+            for v in q:
+                if all((v.co - u.co).length > 1e-6 for u in uniq):
+                    uniq.append(v)
+            if len(uniq) >= 3:
+                try:
+                    tmp.faces.new(uniq)
+                except ValueError:
+                    pass
+    if cap and prof[0][0] > 1e-6:
+        try:
+            tmp.faces.new([r[0] for r in reversed(rings)])
+        except ValueError:
+            pass
+    return merge(bm, tmp)
+
+
+def torus(bm, c, major, minor, m=Matrix(), segs=24, ring=8):
+    prof = [(major + minor * math.cos(2 * math.pi * j / ring), minor * math.sin(2 * math.pi * j / ring))
+            for j in range(ring + 1)]
+    return lathe(bm, prof, segs, T(*c) @ m, cap=False)
+
+
+def sweep(bm, pts, rad, segs=8):
+    """Open tube of radius rad along points, capped."""
+    pts = [Vector(p) for p in pts]
+    n = len(pts)
+    tmp = bmesh.new()
+    tan = [(pts[min(i + 1, n - 1)] - pts[max(i - 1, 0)]).normalized() for i in range(n)]
+    ref = Vector((0, 0, 1)) if abs(tan[0].z) < 0.9 else Vector((1, 0, 0))
+    nrm = tan[0].cross(ref).normalized()
+    rings = []
+    for i in range(n):
+        t = tan[i]
+        nrm = (nrm - t * nrm.dot(t)).normalized()
+        bi = t.cross(nrm)
+        rings.append([tmp.verts.new(pts[i] + (nrm * math.cos(2 * math.pi * k / segs) +
+                                              bi * math.sin(2 * math.pi * k / segs)) * rad) for k in range(segs)])
+    for i in range(n - 1):
+        A, B = rings[i], rings[i + 1]
+        for k in range(segs):
+            tmp.faces.new((A[k], A[(k + 1) % segs], B[(k + 1) % segs], B[k]))
+    tmp.faces.new(rings[0][::-1])
+    tmp.faces.new(rings[-1])
+    return merge(bm, tmp)
+
+
+def prism(bm, pts, y0, y1, r=0.0, seg=2):
+    """Extrude a 2D outline [(x, z)] (counter-clockwise seen from -Y) between y0 and y1."""
+    tmp = bmesh.new()
+    f = [tmp.verts.new((x, y0, z)) for x, z in pts]
+    b = [tmp.verts.new((x, y1, z)) for x, z in pts]
+    n = len(pts)
+    tmp.faces.new(f)
+    tmp.faces.new(b[::-1])
+    for i in range(n):
+        j = (i + 1) % n
+        tmp.faces.new((f[j], f[i], b[i], b[j]))
+    bmesh.ops.recalc_face_normals(tmp, faces=tmp.faces)
+    if r > 0:
+        bmesh.ops.bevel(tmp, geom=list(tmp.edges), offset=r, offset_type="OFFSET", segments=seg,
+                        profile=0.5, affect="EDGES", clamp_overlap=True)
+    return merge(bm, tmp)
+
+
+def leg(bm, x, y, h, rt=0.09, rb=0.07, z0=0.0, segs=10):
+    return cyl(bm, (x, y, z0), (x, y, z0 + h), rb, rt, segs)
+
+
+class Rng:
+    def __init__(self, seed):
+        self.s = seed
+
+    def __call__(self, a=0.0, b=1.0):
+        self.s = (self.s * 1103515245 + 12345) & 0x7FFFFFFF
+        return a + (b - a) * self.s / 0x7FFFFFFF
+
+
+# ------------------------------------------------------------------ builder
+class Builder:
+    """Collects bmeshes per (part, material) of one asset."""
+
+    def __init__(self, asset):
+        self.asset = asset
+        self.parts = {}
+
+    def add(self, part, material, src):
+        key = (part, material)
+        if key not in self.parts:
+            self.parts[key] = bm_new()
+        merge(self.parts[key], src)
+
+    def build(self, coll):
+        objs = []
+        for (part, material), bm in self.parts.items():
+            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
+            bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+            # Sharp corners keep hard normals, bevels shade smooth.
+            sharp = [e for e in bm.edges if len(e.link_faces) == 2 and
+                     e.calc_face_angle(0) > math.radians(38)]
+            bmesh.ops.split_edges(bm, edges=sharp)
+            uv = bm.loops.layers.uv.new("UVMap")
+            for face in bm.faces:
+                face.smooth = True
+                nx, ny, nz = (abs(c) for c in face.normal)
+                for loop in face.loops:
+                    p = loop.vert.co
+                    if nz >= nx and nz >= ny:
+                        u, v = p.x, p.y
+                    elif nx >= ny:
+                        u, v = p.y, p.z
+                    else:
+                        u, v = p.x, p.z
+                    loop[uv].uv = (u / TILE, v / TILE)
+            name = f"{self.asset}__{part}__{material}"
+            me = bpy.data.meshes.new(name)
+            bm.to_mesh(me)
+            bm.free()
+            me.materials.append(mat(material))
+            ob = bpy.data.objects.new(name, me)
+            coll.objects.link(ob)
+            objs.append(ob)
+        return objs
+
+
+
+
+# ------------------------------------------------------------------ Dark Realism materials
+# Имена из промпта Qwen (п.4) поверх материалов офисного кита.
+MAT_DEF.update({
+    "WetConcrete": ((92, 92, 90), 0.0, 0.32, "concrete", {}),
+    "Asphalt": ((46, 47, 50), 0.0, 0.78, "concrete", {}),
+    "Metal": ((150, 154, 156), 0.9, 0.34, "metal", {}),
+    "Wood": ((140, 100, 66), 0.0, 0.55, "wood", {}),
+    "Glass": ((120, 136, 146), 0.0, 0.12, "glass", {"alpha": 0.4}),
+    "DirtyGlass": ((120, 128, 124), 0.0, 0.3, "glass", {"alpha": 0.55}),
+    "Tile": ((178, 176, 168), 0.0, 0.34, "ceramic", {}),
+    "CeilingTile": ((190, 186, 172), 0.0, 0.9, "speckle", {}),
+    "Linoleum": ((112, 110, 100), 0.0, 0.5, "speckle", {}),
+    "Carpet": ((58, 60, 66), 0.0, 0.98, "fabric", {}),
+    "Fabric": ((56, 62, 72), 0.0, 0.95, "fabric", {}),
+    "Leather": ((58, 38, 29), 0.0, 0.52, "leather", {}),
+    "Plastic": ((178, 170, 152), 0.0, 0.56, "plastic", {}),
+    "Brick": ((112, 66, 52), 0.0, 0.88, "concrete", {}),
+    "SafetyOrange": ((226, 122, 44), 0.1, 0.55, "paint", {}),
+    "WarnRed": ((214, 64, 52), 0.1, 0.55, "paint", {}),
+    "Paint": ((150, 153, 158), 0.1, 0.62, "paint", {}),
+    "NeonOrange": ((255, 136, 32), 0.0, 0.3, "flat", {"emit": 6.0}),
+})
+
+# ------------------------------------------------------------------ assets
+ASSETS = []
+
+
+def asset(name):
+    """Декоратор: @asset("HB_Lamp") над функцией f(B), которая вызывает B.add(part, material, bmesh)."""
+    def wrap(fn):
+        ASSETS.append((name, fn))
+        return fn
+    return wrap
+
+
+def engine_id():
+    ids = [e.identifier for e in bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items]
+    return "BLENDER_EEVEE_NEXT" if "BLENDER_EEVEE_NEXT" in ids else "BLENDER_EEVEE"
+
+
+def bounds(objs):
+    lo, hi = Vector((1e9, 1e9, 1e9)), Vector((-1e9, -1e9, -1e9))
+    for ob in objs:
+        for v in ob.data.vertices:
+            p = ob.matrix_world @ v.co
+            lo = Vector(map(min, lo, p))
+            hi = Vector(map(max, hi, p))
+    return lo, hi
+
+
+def tris_of(ob):
+    return sum(len(p.vertices) - 2 for p in ob.data.polygons)
+
+
+def check(per_asset):
+    """Стандарт из промпта. ERROR = модель не принимается, WARN = посмотреть."""
+    out = []
+    for a, objs in per_asset.items():
+        if not a.startswith(PREFIXES):
+            out.append(("ERROR", a, f"префикс не из {PREFIXES}"))
+        if not objs:
+            out.append(("ERROR", a, "пустой ассет"))
+            continue
+        lo, hi = bounds(objs)
+        size = hi - lo
+        if abs(lo.z) > 0.05:
+            out.append(("WARN", a, f"низ не на z=0 (min z={lo.z:.2f}): pivot = центр низа"))
+        for i, (l, h) in enumerate(((lo.x, hi.x), (lo.y, hi.y))):
+            c = (l + h) / 2
+            if abs(c) > max(0.25, (h - l) * 0.15):
+                out.append(("WARN", a, f"центр по {'XY'[i]} смещён на {c:.2f}: pivot должен быть в точке установки (норма для столба с рукой)"))
+        for ob in objs:
+            t = tris_of(ob)
+            if len(ob.name.split("__")) != 3:
+                out.append(("ERROR", ob.name, "имя не <Ассет>__<Деталь>__<Материал>"))
+            if t > 20000:
+                out.append(("ERROR", ob.name, f"{t} треугольников > 20000 (лимит Roblox)"))
+            elif t > 10000:
+                out.append(("WARN", ob.name, f"{t} треугольников > 10000"))
+            bm = bmesh.new()
+            bm.from_mesh(ob.data)
+            zero = sum(1 for f in bm.faces if f.calc_area() < 1e-7)
+            bm.free()
+            if zero:
+                out.append(("WARN", ob.name, f"{zero} вырожденных граней"))
+        if max(size) > 2048:
+            out.append(("ERROR", a, "размер > 2048 studs"))
+    return out
+
+
+def render_preview(per_asset, path):
+    scn = bpy.context.scene
+    scn.render.engine = engine_id()
+    for attr, val in (("taa_render_samples", 32), ("use_raytracing", True), ("use_shadows", True)):
+        try:
+            setattr(scn.eevee, attr, val)
+        except Exception:
+            pass
+    scn.render.resolution_x, scn.render.resolution_y = RES, int(RES * 0.62)
+    try:
+        scn.view_settings.view_transform = "AgX"
+        scn.view_settings.look = "AgX - Medium High Contrast"
+    except Exception:
+        pass
+    world = bpy.data.worlds.new("Stage")
+    world.use_nodes = True
+    world.node_tree.nodes["Background"].inputs["Color"].default_value = (0.22, 0.25, 0.3, 1)
+    world.node_tree.nodes["Background"].inputs["Strength"].default_value = 0.7
+    scn.world = world
+    st = bpy.data.collections.new("_Stage")
+    scn.collection.children.link(st)
+    sun_d = bpy.data.lights.new("Key", "SUN")
+    sun_d.energy, sun_d.angle, sun_d.color = 3.0, math.radians(8), (0.86, 0.92, 1.0)
+    sun = bpy.data.objects.new("Key", sun_d)
+    sun.rotation_euler = (math.radians(52), math.radians(8), math.radians(-35))
+    st.objects.link(sun)
+    gb = bmesh.new()
+    bmesh.ops.create_grid(gb, x_segments=1, y_segments=1, size=4000)
+    gme = bpy.data.meshes.new("Ground")
+    gb.to_mesh(gme)
+    gm = bpy.data.materials.new("StageGround")
+    gm.use_nodes = True
+    gm.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (0.1, 0.1, 0.11, 1)
+    gme.materials.append(gm)
+    g = bpy.data.objects.new("Ground", gme)
+    g.location.z = -0.01
+    st.objects.link(g)
+    lm = bpy.data.materials.new("Label")
+    lm.use_nodes = True
+    lm.node_tree.nodes["Principled BSDF"].inputs["Base Color"].default_value = (0.9, 0.9, 0.9, 1)
+    names = [a for a, _ in ASSETS]
+    per_row = max(1, math.ceil(math.sqrt(len(names) * 1.6)))
+    rows = [names[i:i + per_row] for i in range(0, len(names), per_row)]
+    pts = []
+    y = 0.0
+    for row in rows:
+        bn = [bounds(per_asset[a]) for a in row]
+        depth = max(hi.y - lo.y for lo, hi in bn)
+        gap = max(2.5, max(hi.x - lo.x for lo, hi in bn) * 0.15)
+        x = 0.0
+        for a, (lo, hi) in zip(row, bn):
+            off = Vector((x - lo.x, y - lo.y, 0))
+            for ob in per_asset[a]:
+                ob.location = off
+                ob.hide_render = "__Collider__" in ob.name
+            for cx in (lo.x, hi.x):
+                for cy in (lo.y, hi.y):
+                    for cz in (0.0, hi.z):
+                        pts.append(Vector((cx, cy, cz)) + off)
+            tc = bpy.data.curves.new("L_" + a, "FONT")
+            tc.body = a
+            tc.size = max(0.8, (hi.x - lo.x) * 0.08)
+            tc.align_x = "CENTER"
+            tc.materials.append(lm)
+            to = bpy.data.objects.new("L_" + a, tc)
+            to.location = (off.x + (lo.x + hi.x) / 2, y - tc.size * 1.8, 0.02)
+            st.objects.link(to)
+            pts.append(Vector(to.location))
+            x += (hi.x - lo.x) + gap
+        y += depth + gap * 2
+    d = Vector((0.45, 1.0, -0.72)).normalized()
+    rot = d.to_track_quat("-Z", "Y")
+    cd = bpy.data.cameras.new("Cam")
+    cd.type = "ORTHO"
+    cam = bpy.data.objects.new("Cam", cd)
+    st.objects.link(cam)
+    scn.camera = cam
+    cam.rotation_euler = rot.to_euler()
+    R = rot.to_matrix()
+    right, up = R @ Vector((1, 0, 0)), R @ Vector((0, 1, 0))
+    xs = [p.dot(right) for p in pts]
+    ys = [p.dot(up) for p in pts]
+    cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+    w, h = max(xs) - min(xs), max(ys) - min(ys)
+    cd.ortho_scale = max(w, h * scn.render.resolution_x / scn.render.resolution_y) * 1.06
+    cd.clip_end = 20000
+    cam.location = right * cx + up * cy - d * 3000
+    scn.render.filepath = path
+    bpy.ops.render.render(write_still=True)
+    for a in names:
+        for ob in per_asset[a]:
+            ob.location = (0, 0, 0)
+    for ob in list(st.objects):
+        bpy.data.objects.remove(ob)
+    bpy.data.collections.remove(st)
+
+
+def render_closeups(per_asset, path, cell=560, cols=4):
+    """Каждый ассет крупно (вид 3/4 спереди-сверху, ключ + контровой свет) — лист снимков для оценки детализации."""
+    scn = bpy.context.scene
+    bpy.context.view_layer.update()  # the overview moved everything; refresh matrix_world
+    scn.render.engine = engine_id()
+    scn.render.resolution_x = scn.render.resolution_y = cell
+    scn.render.film_transparent = False
+    world = bpy.data.worlds.new("Close")
+    world.use_nodes = True
+    world.node_tree.nodes["Background"].inputs["Color"].default_value = (0.16, 0.18, 0.21, 1)
+    world.node_tree.nodes["Background"].inputs["Strength"].default_value = 0.6
+    scn.world = world
+    st = bpy.data.collections.new("_Close")
+    scn.collection.children.link(st)
+    lights = []
+    for name, kind, energy, col, rot in (
+        ("Key", "SUN", 3.2, (1.0, 0.86, 0.68), (52, 8, -35)),      # тёплый, как натриевый фонарь
+        ("Rim", "SUN", 2.2, (0.62, 0.74, 1.0), (60, 0, 150)),      # холодный контровой, как небо в дождь
+    ):
+        d = bpy.data.lights.new(name, kind)
+        d.energy, d.color, d.angle = energy, col, math.radians(6)
+        ob = bpy.data.objects.new(name, d)
+        ob.rotation_euler = tuple(math.radians(a) for a in rot)
+        st.objects.link(ob)
+        lights.append(ob)
+    cd = bpy.data.cameras.new("CloseCam")
+    cd.type = "ORTHO"
+    cam = bpy.data.objects.new("CloseCam", cd)
+    st.objects.link(cam)
+    scn.camera = cam
+    names = [a for a, _ in ASSETS]
+    tiles = []
+    for a in names:
+        for b in names:
+            for ob in per_asset[b]:
+                ob.hide_render = (b != a) or ("__Collider__" in ob.name)
+        lo, hi = bounds([ob for ob in per_asset[a] if "__Collider__" not in ob.name] or per_asset[a])
+        d = Vector((0.55, 1.0, -0.5)).normalized()
+        rot = d.to_track_quat("-Z", "Y")
+        Rm = rot.to_matrix()
+        right, up = Rm @ Vector((1, 0, 0)), Rm @ Vector((0, 1, 0))
+        corners = [Vector((x, y, z)) for x in (lo.x, hi.x) for y in (lo.y, hi.y) for z in (lo.z, hi.z)]
+        xs = [p.dot(right) for p in corners]
+        ys = [p.dot(up) for p in corners]
+        cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+        cd.ortho_scale = max(max(xs) - min(xs), max(ys) - min(ys)) * 1.1
+        radius = (hi - lo).length
+        cam.location = right * cx + up * cy - d * (radius * 3 + 10)
+        cam.rotation_euler = rot.to_euler()
+        cd.clip_start, cd.clip_end = 0.1, radius * 8 + 40
+        tmp = os.path.join(OUT, f"_close_{a}.png")
+        scn.render.filepath = tmp
+        bpy.ops.render.render(write_still=True)
+        img = bpy.data.images.load(tmp)
+        px = np.array(img.pixels[:], dtype=np.float32).reshape(cell, cell, 4)[::-1]
+        bpy.data.images.remove(img)
+        os.remove(tmp)
+        tiles.append(px)
+    for b in names:
+        for ob in per_asset[b]:
+            ob.hide_render = False
+    rows = math.ceil(len(tiles) / cols)
+    sheet = np.zeros((rows * cell, min(cols, len(tiles)) * cell, 4), dtype=np.float32)
+    sheet[..., 3] = 1
+    for i, t in enumerate(tiles):
+        r, k = divmod(i, cols)
+        sheet[r * cell:(r + 1) * cell, k * cell:(k + 1) * cell] = t
+    for ob in list(st.objects):
+        bpy.data.objects.remove(ob)
+    bpy.data.collections.remove(st)
+    h, w = sheet.shape[:2]
+    out = bpy.data.images.new("closeups", w, h, alpha=True)
+    out.pixels.foreach_set(np.ascontiguousarray(sheet[::-1]).ravel())
+    out.filepath_raw = path
+    out.file_format = "PNG"
+    out.save()
+    return names
+
+
+def export_fbx(per_asset, pack):
+    chunks, cur = [], []
+    for a, _ in ASSETS:
+        objs = per_asset[a]
+        if cur and len(cur) + len(objs) > MAX_OBJECTS:
+            chunks.append(cur)
+            cur = []
+        cur = cur + objs
+    if cur:
+        chunks.append(cur)
+    files = []
+    for i, objs in enumerate(chunks):
+        bpy.ops.object.select_all(action="DESELECT")
+        for ob in objs:
+            ob.select_set(True)
+        bpy.context.view_layer.objects.active = objs[0]
+        suffix = chr(65 + i) if len(chunks) > 1 else ""
+        path = os.path.join(OUT, f"{pack}{suffix}.fbx")
+        bpy.ops.export_scene.fbx(
+            filepath=path, use_selection=True, object_types={"MESH"}, use_mesh_modifiers=True,
+            mesh_smooth_type="FACE", bake_anim=False, embed_textures=False, path_mode="STRIP",
+            axis_forward="-Z", axis_up="Y")
+        files.append((path, len(objs)))
+    return files
+
+
+def run(pack, preview=True, textures=True):
+    """Строит всё из @asset, проверяет, экспортирует. pack — имя пакета (V1, V2...)."""
+    global TEX_DIR
+    os.makedirs(OUT, exist_ok=True)
+    for ob in list(bpy.data.objects):
+        bpy.data.objects.remove(ob)
+    for c in list(bpy.data.collections):
+        bpy.data.collections.remove(c)
+    scn = bpy.context.scene
+    per_asset, lines, failed = {}, [], []
+    seen = set()
+    for name, fn in ASSETS:
+        if name in seen:
+            lines.append(f"ERROR {name}: имя ассета повторяется")
+            continue
+        seen.add(name)
+        coll = bpy.data.collections.new(name)
+        scn.collection.children.link(coll)
+        B = Builder(name)
+        try:
+            fn(B)
+            bad = sorted({m for (_p, m) in B.parts if m not in MAT_DEF})
+            if bad:
+                raise ValueError(f"материалы не из списка: {bad}")
+            per_asset[name] = B.build(coll)
+        except Exception as e:  # один сломанный ассет не роняет пакет
+            import traceback
+            failed.append(name)
+            lines.append(f"ERROR {name} build: {e!r}")
+            traceback.print_exc()
+    ASSETS[:] = [(a, f) for a, f in ASSETS if per_asset.get(a)]
+    bpy.context.view_layer.update()
+    used = sorted({ob.name.split("__")[-1] for objs in per_asset.values() for ob in objs})
+    if textures:
+        TEX_DIR = os.path.join(OUT, "tex")
+        for m in used:
+            hook_textures(m, make_textures(m))
+    for a, objs in per_asset.items():
+        lo, hi = bounds(objs)
+        s = hi - lo
+        tris = sum(tris_of(ob) for ob in objs)
+        mats = sorted({ob.name.split("__")[-1] for ob in objs})
+        coll = any("__Collider__" in ob.name for ob in objs)
+        lines.append(f"REPORT {a} tris={tris} size={s.x:.2f}x{s.y:.2f}x{s.z:.2f} objects={len(objs)} "
+                     f"mats={','.join(mats)} collider={'yes' if coll else 'no'}")
+    for level, who, msg in check(per_asset):
+        lines.append(f"CHECK {level} {who}: {msg}")
+    for path, n in (export_fbx(per_asset, pack) if per_asset else []):
+        lines.append(f"FBX {path} objects={n}")
+    if textures and used:
+        lines.append(f"TEX {TEX_DIR} materials={','.join(used)}")
+    if preview and per_asset:
+        p = os.path.join(OUT, "preview.png")
+        render_preview(per_asset, p)
+        lines.append(f"PREVIEW {p}")
+        cp = os.path.join(OUT, "closeups.png")
+        order = render_closeups(per_asset, cp)
+        lines.append(f"CLOSEUPS {cp} order={','.join(order)}")
+    bpy.ops.wm.save_as_mainfile(filepath=os.path.join(OUT, f"{pack}.blend"))
+    errors = sum(1 for line in lines if line.startswith(("ERROR", "CHECK ERROR")))
+    lines.append(f"DONE {pack} assets={len(per_asset)} failed={len(failed)} errors={errors} "
+                 f"time={time.time() - T0:.0f}s")
+    text = "\n".join(lines)
+    with open(os.path.join(OUT, "report.txt"), "w", encoding="utf-8") as fh:
+        fh.write(text + "\n")
+    print(text, flush=True)
+
+
+def png(name, rgba):
+    """Сохраняет картинку numpy (H, W, 4), значения 0..1, строка 0 = верх, в out/<пакет>/<name>.png."""
+    rgba = np.asarray(rgba, dtype=np.float32)
+    h, w = rgba.shape[:2]
+    os.makedirs(OUT, exist_ok=True)
+    path = os.path.join(OUT, name + ".png")
+    img = bpy.data.images.new(name, w, h, alpha=True)
+    img.pixels.foreach_set(np.ascontiguousarray(rgba[::-1]).ravel())
+    img.filepath_raw = path
+    img.file_format = "PNG"
+    img.save()
+    print(f"PNG {path} {w}x{h}", flush=True)
+    return path
+
+
+__all__ = ["box", "cyl", "ball", "lathe", "torus", "sweep", "prism", "leg", "T", "euler", "bm_new",
+           "merge", "xf", "Rng", "asset", "run", "png", "fbm", "blur", "norm01", "scratches", "specks",
+           "MAT_DEF", "Matrix", "Vector", "math", "np"]
