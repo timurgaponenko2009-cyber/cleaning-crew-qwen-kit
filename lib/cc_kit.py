@@ -99,6 +99,10 @@ def mat(name, label=None):
     if "emit" in extra:
         b.inputs["Emission Color"].default_value = col
         b.inputs["Emission Strength"].default_value = extra["emit"]
+    if extra.get("holdout"):
+        out = next(n for n in nt.nodes if n.type == "OUTPUT_MATERIAL")
+        hn = nt.nodes.new("ShaderNodeHoldout")
+        nt.links.new(hn.outputs[0], out.inputs["Surface"])
     if "alpha" in extra:
         b.inputs["Alpha"].default_value = extra["alpha"]
         try:
@@ -697,7 +701,7 @@ MAT_DEF.update({
     "Leather": ((58, 38, 29), 0.0, 0.52, "leather", {}),
     "Plastic": ((178, 170, 152), 0.0, 0.56, "plastic", {}),
     "Brick": ((112, 66, 52), 0.0, 0.88, "concrete", {}),
-    "SafetyOrange": ((226, 122, 44), 0.1, 0.55, "paint", {}),
+    "SafetyOrange": ((255, 136, 32), 0.1, 0.5, "paint", {}),  # brand accent #FF8820
     "WarnRed": ((214, 64, 52), 0.1, 0.55, "paint", {}),
     "Paint": ((150, 153, 158), 0.1, 0.62, "paint", {}),
     "NeonOrange": ((255, 136, 32), 0.0, 0.3, "flat", {"emit": 6.0}),
@@ -770,6 +774,7 @@ MAT_DEF.update({
     "LiquidDirty": ((100, 90, 60), 0.0, 0.2, "plastic", {}),
     "Opal": ((240, 242, 240), 0.0, 0.5, "glass", {'alpha': 0.85, 'emit': 0.6}),
     "NeonWhite": ((220, 240, 255), 0.0, 0.3, "flat", {'emit': 5.0}),
+    "Holdout": ((0, 0, 0), 0.0, 1.0, "flat", {"holdout": True}),  # render cut-out: alpha 0 in icons/shots
     "LightCold": ((214, 228, 255), 0.0, 0.3, "flat", {'emit': 3.0}),
     "CoolLED": ((214, 228, 255), 0.0, 0.3, "flat", {'emit': 3.0}),
     "WarmLED": ((255, 196, 140), 0.0, 0.3, "flat", {'emit': 3.0}),
@@ -1604,6 +1609,16 @@ class Canvas:
         return img
 
 
+BRAND = {
+    "Navy": "#12284A", "Blue": "#1D5FD0", "Orange": "#FF8820", "OrangeLight": "#FFB238",
+    "Teal": "#19C2B4", "Aqua": "#8DEBE3", "White": "#F7FAFD", "Mist": "#E3EAF4",
+    "Graphite": "#1A2333", "Lime": "#B5E23A", "Gold": "#FFC23A",
+    "Success": "#3CCB7F", "Error": "#F0505C", "Warning": "#FFB238", "Locked": "#8E97A9",
+    "Common": "#A7B0BC", "Uncommon": "#4FCB6B", "Rare": "#3A8DFF", "Epic": "#A266FF",
+    "Legendary": "#FFBE2E",
+}
+
+
 def canvas(w, h, ss=4):
     return Canvas(w, h, ss)
 
@@ -1623,7 +1638,7 @@ def _ui_save(name, img, slice=None, kind="PNG"):
         UI_LINES.append(f"CHECK WARN {name}: непрозрачные пиксели у края ({edge:.2f}) — свечение или обводка обрезаны")
     if slice:
         l, t, r, b = slice
-        if not (0 < l < r < w and 0 < t < b < h):
+        if not (0 <= l < r <= w and 0 <= t < b <= h):  # (20, 0, 492, 40): stretch along one axis only
             UI_LINES.append(f"CHECK ERROR {name}: slice {slice} вне картинки {w}x{h}")
 
 
@@ -1968,4 +1983,4 @@ __all__ = ["box", "cyl", "ball", "lathe", "torus", "sweep", "prism", "leg", "T",
            "rrect", "arcpts", "soften", "displace", "mirror_x", "blur2", "emblem",
            "canvas", "Canvas", "sd_circle", "sd_rrect", "sd_seg", "sd_arc", "sd_poly", "sd_union",
            "sd_sub", "sd_round", "fill", "stroke", "lin_grad", "rad_grad", "noise", "icon", "icon_img",
-           "text3d"]
+           "text3d", "BRAND"]
