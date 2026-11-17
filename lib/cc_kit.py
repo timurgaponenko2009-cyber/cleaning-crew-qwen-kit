@@ -809,12 +809,15 @@ SIZES = {}  # asset -> (w, d, h) given in @asset(size=...)
 SHOTS = []  # shot() requests, rendered at the end of run()
 
 
-def asset(name, size=None):
+def asset(name, size=None, render_only=False):
     """Декоратор: @asset("HB_Lamp") над функцией f(B), которая вызывает B.add(part, material, bmesh).
-    size=(ширина X, глубина Y, высота Z) из ТЗ: отклонение больше 5 % по любой оси — CHECK ERROR."""
+    size=(ширина X, глубина Y, высота Z) из ТЗ: отклонение больше 5 % по любой оси — CHECK ERROR.
+    render_only=True: модель только для рендера иконок (UI_M_*): без FBX и проверок."""
     def wrap(fn):
         if size:
             SIZES[name] = tuple(size)
+        if render_only:
+            RENDER_ONLY.add(name)
         ASSETS.append((name, fn))
         return fn
     return wrap
@@ -1110,6 +1113,8 @@ def render_closeups(per_asset, path, cell=560, cols=4):
 def export_fbx(per_asset, pack):
     chunks, cur = [], []
     for a, _ in ASSETS:
+        if a not in per_asset:
+            continue
         objs = per_asset[a]
         if cur and len(cur) + len(objs) > MAX_OBJECTS:
             chunks.append(cur)
@@ -1182,12 +1187,13 @@ def run(pack, preview=True, textures=True, wear="worn"):
         coll = any("__Collider__" in ob.name for ob in objs)
         lines.append(f"REPORT {a} tris={tris} size={s.x:.2f}x{s.y:.2f}x{s.z:.2f} objects={len(objs)} "
                      f"mats={','.join(mats)} collider={'yes' if coll else 'no'}")
-    for level, who, msg in check(per_asset):
+    game_assets = {a: o for a, o in per_asset.items() if a not in RENDER_ONLY}
+    for level, who, msg in check(game_assets):
         lines.append(f"CHECK {level} {who}: {msg}")
     if wear not in WEAR_LEVELS:
         lines.append(f"CHECK ERROR {pack}: wear={wear!r}, нужно clean, used или worn")
     lines.append(f"WEAR {wear}")
-    for path, n in (export_fbx(per_asset, pack) if per_asset else []):
+    for path, n in (export_fbx(game_assets, pack) if game_assets else []):
         lines.append(f"FBX {path} objects={n}")
     if textures and used:
         lines.append(f"TEX {TEX_DIR} materials={','.join(used)}")
@@ -1225,6 +1231,14 @@ def run(pack, preview=True, textures=True, wear="worn"):
             import traceback
             tb = traceback.format_exc().strip().splitlines()
             lines.append(f"ERROR shot {req.get('name')}: {e!r} at {tb[-3].strip() if len(tb) > 2 else ''}")
+    lines.extend(UI_LINES)
+    if UI_PNGS:
+        sheet = os.path.join(OUT, "ui_sheet.png")
+        try:
+            _ui_sheet(sheet)
+            lines.append(f"UISHEET {sheet} pngs={len(UI_PNGS)}")
+        except Exception as e:
+            lines.append(f"ERROR ui_sheet: {e!r}")
     errors = sum(1 for line in lines if line.startswith(("ERROR", "CHECK ERROR")))
     lines.append(f"DONE {pack} assets={len(per_asset)} failed={len(failed)} errors={errors} "
                  f"time={time.time() - T0:.0f}s")
@@ -1235,13 +1249,18 @@ def run(pack, preview=True, textures=True, wear="worn"):
 
 
 def shot(name, items, cam, look, size=(1920, 1080), sun=(6, 235), lens=35, ground="Concrete",
-         ground_size=400, haze=0.35):
+         ground_size=400, haze=0.35, transparent=False, only=None, sky="golden", dof=None,
+         tiles=None, bleed=8):
     """A rendered scene (loading screen, menu background), drawn at the end of run().
     items: [(asset, (x, y, z), yaw_degrees), ...]; asset is from this script or
     "V1a/HB_LampPost" (pack/asset of an already built pack). cam, look: camera and target
     points (studs). sun: (elevation, azimuth) in degrees. Saved as out/<pack>/<name>.png."""
+    # transparent: no sky and ground (front parallax layers); only: refs of `items` to draw;
+    # sky: "golden" (warm evening) | "rain_dusk" (blue rainy dusk, wet mirror ground);
+    # dof: (focus distance, f-stop); tiles: (cols, rows) -> <name>_r<R>c<C>.png, each <= 1024.
     SHOTS.append(dict(name=name, items=items, cam=cam, look=look, size=size, sun=sun, lens=lens,
-                      ground=ground, ground_size=ground_size, haze=haze))
+                      ground=ground, ground_size=ground_size, haze=haze, transparent=transparent,
+                      only=only, sky=sky, dof=dof, tiles=tiles, bleed=bleed))
 
 
 def _collection_for(ref):
@@ -1266,7 +1285,10 @@ def _collection_for(ref):
     return bpy.data.collections[a]
 
 
-def _render_shot(per_asset, name, items, cam, look, size, sun, lens, ground, ground_size, haze):
+def _render_shot(per_asset, name, items, cam, look, size, sun, lens, ground, ground_size, haze,
+                 transparent=False, only=None, sky="golden", dof=None, tiles=None, bleed=8):
+    sky_mode = sky
+    rain = sky_mode == "rain_dusk"
     scn = bpy.context.scene
     scn.render.engine = engine_id()
     for attr, val in (("taa_render_samples", 64), ("use_raytracing", True), ("use_shadows", True)):
@@ -1318,8 +1340,16 @@ def _render_shot(per_asset, name, items, cam, look, size, sun, lens, ground, gro
     scn.world = world
     sd = bpy.data.lights.new("Sun", "SUN")
     sd.energy, sd.angle, sd.color = 6.5, math.radians(2.5), (1.0, 0.66, 0.38)  # golden hour
+    so_rot = None
+    if rain:  # blue rainy dusk: cool sky fill, a soft moon key; lamps and neon glow on top
+        for link in list(bg.inputs["Color"].links):
+            nt.links.remove(link)
+        bg.inputs["Color"].default_value = (0.07, 0.1, 0.19, 1)
+        bg.inputs["Strength"].default_value = 1.4
+        sd.energy, sd.color, sd.angle = 1.6, (0.6, 0.7, 1.0), math.radians(8)
+        so_rot = (math.radians(58), 0, math.radians(sun[1]))
     so = bpy.data.objects.new("Sun", sd)
-    so.rotation_euler = (math.radians(90 - sun[0]), 0, math.radians(sun[1]))
+    so.rotation_euler = so_rot or (math.radians(90 - sun[0]), 0, math.radians(sun[1]))
     st.objects.link(so)
     gb = bmesh.new()
     bmesh.ops.create_grid(gb, x_segments=1, y_segments=1, size=ground_size / 2)
@@ -1331,14 +1361,25 @@ def _render_shot(per_asset, name, items, cam, look, size, sun, lens, ground, gro
         for li in poly.loop_indices:
             co = gme.vertices[gme.loops[li].vertex_index].co
             uv.data[li].uv = (co.x / TILE, co.y / TILE)
-    gme.materials.append(mat(ground if ground in MAT_DEF else "Concrete"))
-    st.objects.link(bpy.data.objects.new("ShotGround", gme))
+    if rain:  # wet street: dark mirror that picks up every lamp
+        gm = bpy.data.materials.new("WetShotGround")
+        gm.use_nodes = True
+        gpb = gm.node_tree.nodes.get("Principled BSDF")
+        gpb.inputs["Base Color"].default_value = (0.03, 0.032, 0.038, 1)
+        gpb.inputs["Roughness"].default_value = 0.07
+        gme.materials.append(gm)
+    else:
+        gme.materials.append(mat(ground if ground in MAT_DEF else "Concrete"))
+    gob = bpy.data.objects.new("ShotGround", gme)
+    gob.hide_render = bool(transparent)
+    st.objects.link(gob)
     for (ref, pos, yaw), coll in zip(items, sources):
         inst = bpy.data.objects.new("I_" + ref.replace("/", "_"), None)
         inst.instance_type = "COLLECTION"
         inst.instance_collection = coll
         inst.location = pos
         inst.rotation_euler = (0, 0, math.radians(yaw))
+        inst.hide_render = bool(only) and ref not in only
         st.objects.link(inst)
     # loaded pack collections are not in the scene; instancing works without linking them
     cd = bpy.data.cameras.new("ShotCam")
@@ -1349,6 +1390,10 @@ def _render_shot(per_asset, name, items, cam, look, size, sun, lens, ground, gro
     camo.rotation_euler = (Vector(look) - Vector(cam)).to_track_quat("-Z", "Y").to_euler()
     st.objects.link(camo)
     scn.camera = camo
+    if dof:
+        cd.dof.use_dof = True
+        cd.dof.focus_distance, cd.dof.aperture_fstop = float(dof[0]), float(dof[1])
+    scn.render.film_transparent = bool(transparent)
     # Hero glass: dark and reflective (the closeup dust pattern reads as a wall from afar).
     for m in bpy.data.materials:
         if m.name.split(".")[0] in ("Glass", "DirtyGlass", "DustyGlass", "BoardGlass") and m.use_nodes:
@@ -1370,6 +1415,7 @@ def _render_shot(per_asset, name, items, cam, look, size, sun, lens, ground, gro
     path = os.path.join(OUT, name + ".png")
     scn.render.filepath = path
     bpy.ops.render.render(write_still=True)
+    scn.render.film_transparent = False
     for a in per_asset:
         lc = bpy.context.view_layer.layer_collection.children.get(a)
         if lc is not None:
@@ -1377,7 +1423,23 @@ def _render_shot(per_asset, name, items, cam, look, size, sun, lens, ground, gro
     for ob in list(st.objects):
         bpy.data.objects.remove(ob)
     bpy.data.collections.remove(st)
-    return f"SHOT {path} {size[0]}x{size[1]} items={len(items)}"
+    line = f"SHOT {path} {size[0]}x{size[1]} items={len(items)} sky={sky_mode}"
+    if tiles:
+        img = bpy.data.images.load(path)
+        W, H = size
+        px = np.array(img.pixels[:], dtype=np.float32).reshape(H, W, 4)[::-1]
+        bpy.data.images.remove(img)
+        cols, rows = tiles
+        tw, th = W // cols, H // rows
+        for r in range(rows):
+            for c in range(cols):
+                x0, y0 = max(0, c * tw - bleed), max(0, r * th - bleed)
+                x1, y1 = min(W, (c + 1) * tw + bleed), min(H, (r + 1) * th + bleed)
+                _ui_save(f"{name}_r{r}c{c}", px[y0:y1, x0:x1].copy(), kind="TILE")
+        line += f" tiles={cols}x{rows} bleed={bleed}"
+    elif max(size) > 1024:
+        line += " (CHECK WARN: больше 1024 — для игры нужен tiles=(3, 2))"
+    return line
 
 
 def png(name, rgba):
@@ -1395,7 +1457,515 @@ def png(name, rgba):
     return path
 
 
+
+# ================================================================== UI (17.11)
+# 2D canvas with signed distance fields, 3D -> PNG icons, text3d, a UI sheet.
+# Brief: 3_UI_HUD_МЕНЮ.md §3. Coordinates are pixels of the FINAL image, y down;
+# drawing happens at ss x resolution and is averaged down in C.png().
+
+UI_LINES = []  # PNG / CHECK lines for report.txt
+UI_PNGS = []  # (name, rgba) for ui_sheet.png
+RENDER_ONLY = set()  # @asset(render_only=True): no FBX, no checks
+
+
+def _col(c):
+    """'#RRGGBB' | '#RRGGBBAA' | (r, g, b) | (r, g, b, a), 0..255 -> float RGBA 0..1."""
+    if isinstance(c, str):
+        h = c.lstrip("#")
+        v = [int(h[i:i + 2], 16) for i in range(0, len(h), 2)]
+    else:
+        v = list(c)
+    if len(v) == 3:
+        v.append(255)
+    return np.array(v, dtype=np.float32) / 255.0
+
+
+def _box_blur_1d(a, r, axis):
+    if r < 1:
+        return a
+    pad = [(0, 0)] * a.ndim
+    pad[axis] = (r + 1, r)
+    c = np.cumsum(np.pad(a, pad, mode="edge"), axis=axis)
+    hi = np.take(c, range(2 * r + 1, c.shape[axis]), axis=axis)
+    lo = np.take(c, range(0, c.shape[axis] - 2 * r - 1), axis=axis)
+    return (hi - lo) / (2 * r + 1)
+
+
+def _gauss(a, sigma):
+    """Fast gaussian-like blur (three box passes) of a 2D or 3D (H, W, C) array."""
+    if sigma <= 0.3:
+        return a
+    r = max(1, int(round(sigma * 0.87)))
+    for _ in range(3):
+        a = _box_blur_1d(_box_blur_1d(a, r, 0), r, 1)
+    return a
+
+
+def _down(a, k):
+    if k == 1:
+        return a
+    h, w = a.shape[0] // k, a.shape[1] // k
+    return a[:h * k, :w * k].reshape(h, k, w, k, *a.shape[2:]).mean(axis=(1, 3))
+
+
+def _up(a, k):
+    return a if k == 1 else np.repeat(np.repeat(a, k, axis=0), k, axis=1)
+
+
+class Canvas:
+    """C = canvas(w, h, ss=4). C.x, C.y: pixel-centre coordinate grids (final pixels)."""
+
+    def __init__(self, w, h, ss=4):
+        self.w, self.h, self.ss = int(w), int(h), int(ss)
+        H, W = self.h * self.ss, self.w * self.ss
+        self.x = (np.arange(W, dtype=np.float32)[None, :] + 0.5) / self.ss
+        self.y = (np.arange(H, dtype=np.float32)[:, None] + 0.5) / self.ss
+        self.x = np.broadcast_to(self.x, (H, W))
+        self.y = np.broadcast_to(self.y, (H, W))
+        self.buf = np.zeros((H, W, 4), dtype=np.float32)  # premultiplied
+
+    def _src(self, col):
+        if isinstance(col, np.ndarray) and col.ndim == 3:
+            return col.astype(np.float32)
+        return _col(col)[None, None, :]
+
+    def over(self, col, mask, alpha=1.0):
+        """Paints colour or gradient `col` through mask 0..1 on top."""
+        src = self._src(col)
+        a = np.clip(mask, 0, 1)[..., None] * float(alpha) * src[..., 3:4]
+        pre = np.concatenate([src[..., :3] * a, a], axis=-1)
+        self.buf = pre + self.buf * (1 - a)
+        return self
+
+    def under(self, col, mask, alpha=1.0):
+        """Paints behind what is already there (outlines, backplates)."""
+        src = self._src(col)
+        a = np.clip(mask, 0, 1)[..., None] * float(alpha) * src[..., 3:4]
+        pre = np.concatenate([src[..., :3] * a, a], axis=-1)
+        self.buf = self.buf + pre * (1 - self.buf[..., 3:4])
+        return self
+
+    def _soft(self, mask, blur, dx=0.0, dy=0.0):
+        m = _down(np.clip(mask, 0, 1), self.ss)
+        if dx or dy:
+            m = np.roll(m, (int(round(dy)), int(round(dx))), axis=(0, 1))
+        return np.clip(_up(_gauss(m, blur), self.ss), 0, 1)
+
+    def shadow(self, mask, blur=8, dx=0, dy=4, col="#12284A", alpha=0.25):
+        """Soft drop shadow of `mask` (draw it before the shape)."""
+        return self.over(col, self._soft(mask, blur, dx, dy), alpha)
+
+    def glow(self, mask, blur=10, col="#8DEBE3", alpha=0.5):
+        """Soft halo around `mask`."""
+        return self.over(col, self._soft(mask, blur), alpha)
+
+    def paste(self, img, x, y, scale=1.0):
+        """Pastes a straight-alpha numpy image (h, w, 4) with its top-left at (x, y)."""
+        img = np.asarray(img, dtype=np.float32)
+        if scale != 1.0:
+            h, w = img.shape[:2]
+            nh, nw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+            ys = np.clip(((np.arange(nh) + 0.5) / scale).astype(int), 0, h - 1)
+            xs = np.clip(((np.arange(nw) + 0.5) / scale).astype(int), 0, w - 1)
+            img = img[ys][:, xs]
+        big = _up(img, self.ss)
+        H, W = self.buf.shape[:2]
+        x0, y0 = int(round(x * self.ss)), int(round(y * self.ss))
+        sx0, sy0 = max(0, -x0), max(0, -y0)
+        x1, y1 = min(W, x0 + big.shape[1]), min(H, y0 + big.shape[0])
+        if x1 <= max(x0, 0) or y1 <= max(y0, 0):
+            return self
+        part = big[sy0:sy0 + (y1 - max(y0, 0)), sx0:sx0 + (x1 - max(x0, 0))]
+        a = part[..., 3:4]
+        region = self.buf[max(y0, 0):y1, max(x0, 0):x1]
+        self.buf[max(y0, 0):y1, max(x0, 0):x1] = np.concatenate([part[..., :3] * a, a], -1) + region * (1 - a)
+        return self
+
+    def image(self):
+        """The final straight-alpha image (h, w, 4), colour bled under transparent pixels."""
+        pre = _down(self.buf, self.ss)
+        a = pre[..., 3:4]
+        rgb = np.where(a > 1e-4, pre[..., :3] / np.maximum(a, 1e-4), 0)
+        # Bleed colour into transparent pixels: no dark fringes when the game scales it.
+        known = (a[..., 0] > 0.01).astype(np.float32)
+        if known.any() and known.min() == 0:
+            col, wgt = rgb * known[..., None], known
+            for s in (1, 2, 4, 8, 16, 32):
+                bc, bw = _gauss(col, s), _gauss(wgt, s)
+                fillc = bc / np.maximum(bw, 1e-6)[..., None]
+                miss = (known < 0.5) & (bw > 1e-4)
+                rgb = np.where(miss[..., None], fillc, rgb)
+                known = np.maximum(known, miss.astype(np.float32))
+        return np.concatenate([np.clip(rgb, 0, 1), np.clip(a, 0, 1)], -1)
+
+    def png(self, name, slice=None):
+        img = self.image()
+        _ui_save(name, img, slice)
+        return img
+
+
+def canvas(w, h, ss=4):
+    return Canvas(w, h, ss)
+
+
+def _ui_save(name, img, slice=None, kind="PNG"):
+    h, w = img.shape[:2]
+    a = img[..., 3]
+    cover = float((a > 0.02).mean())
+    edge = max(a[0].max(), a[-1].max(), a[:, 0].max(), a[:, -1].max())
+    png(name, img)
+    UI_PNGS.append((name, img))
+    sl = f" slice={tuple(slice)}" if slice else ""
+    UI_LINES.append(f"{kind} {name} {w}x{h} alpha={cover:.2f}{sl}")
+    if max(w, h) > 1024:
+        UI_LINES.append(f"CHECK ERROR {name}: сторона {max(w, h)} > 1024 (лимит Roblox)")
+    if edge > 0.03 and cover < 0.98:
+        UI_LINES.append(f"CHECK WARN {name}: непрозрачные пиксели у края ({edge:.2f}) — свечение или обводка обрезаны")
+    if slice:
+        l, t, r, b = slice
+        if not (0 < l < r < w and 0 < t < b < h):
+            UI_LINES.append(f"CHECK ERROR {name}: slice {slice} вне картинки {w}x{h}")
+
+
+# --- signed distances (pixels; negative inside)
+def sd_circle(C, cx, cy, r):
+    return np.hypot(C.x - cx, C.y - cy) - r
+
+
+def sd_rrect(C, cx, cy, w, h, r):
+    r = min(r, w / 2, h / 2)
+    qx = np.abs(C.x - cx) - (w / 2 - r)
+    qy = np.abs(C.y - cy) - (h / 2 - r)
+    out = np.hypot(np.maximum(qx, 0), np.maximum(qy, 0))
+    return out + np.minimum(np.maximum(qx, qy), 0) - r
+
+
+def sd_seg(C, x0, y0, x1, y1):
+    px, py = C.x - x0, C.y - y0
+    dx, dy = x1 - x0, y1 - y0
+    t = np.clip((px * dx + py * dy) / max(dx * dx + dy * dy, 1e-9), 0, 1)
+    return np.hypot(px - dx * t, py - dy * t)
+
+
+def sd_arc(C, cx, cy, r, a0, a1):
+    """Distance to an arc; degrees, 0 = right, counter-clockwise (screen up)."""
+    ang = np.degrees(np.arctan2(-(C.y - cy), C.x - cx)) % 360
+    lo, span = a0 % 360, (a1 - a0) % 360 or 360
+    inside = ((ang - lo) % 360) <= span
+    d_ring = np.abs(np.hypot(C.x - cx, C.y - cy) - r)
+    ends = []
+    for a in (a0, a1):
+        ex, ey = cx + r * math.cos(math.radians(a)), cy - r * math.sin(math.radians(a))
+        ends.append(np.hypot(C.x - ex, C.y - ey))
+    return np.where(inside, d_ring, np.minimum(*ends))
+
+
+def sd_poly(C, pts):
+    pts = [(float(x), float(y)) for x, y in pts]
+    d = None
+    sign = np.ones_like(C.x)
+    n = len(pts)
+    for i in range(n):
+        x0, y0 = pts[i]
+        x1, y1 = pts[(i + 1) % n]
+        seg = sd_seg(C, x0, y0, x1, y1)
+        d = seg if d is None else np.minimum(d, seg)
+        cond = ((C.y >= y0) != (C.y >= y1)) & (C.x < (x1 - x0) * (C.y - y0) / ((y1 - y0) or 1e-9) + x0)
+        sign = np.where(cond, -sign, sign)
+    return d * sign
+
+
+def sd_union(a, b):
+    return np.minimum(a, b)
+
+
+def sd_sub(a, b):
+    return np.maximum(a, -b)
+
+
+def sd_round(d, r):
+    return d - r
+
+
+def fill(C, d):
+    """Antialiased 0..1 mask of the inside of d."""
+    return np.clip(0.5 - d * C.ss, 0, 1)
+
+
+def stroke(C, d, w):
+    """Antialiased line of width w px along the contour of d."""
+    return np.clip(0.5 - (np.abs(d) - w / 2) * C.ss, 0, 1)
+
+
+def lin_grad(C, p0, p1, c0, c1):
+    (x0, y0), (x1, y1) = p0, p1
+    dx, dy = x1 - x0, y1 - y0
+    t = np.clip(((C.x - x0) * dx + (C.y - y0) * dy) / max(dx * dx + dy * dy, 1e-9), 0, 1)[..., None]
+    return _col(c0)[None, None] * (1 - t) + _col(c1)[None, None] * t
+
+
+def rad_grad(C, cx, cy, r, c0, c1):
+    t = np.clip(np.hypot(C.x - cx, C.y - cy) / max(r, 1e-9), 0, 1)[..., None]
+    return _col(c0)[None, None] * (1 - t) + _col(c1)[None, None] * t
+
+
+def noise(w, h, sigmas=(32, 16, 8, 4), seed=7):
+    """Seamless fbm 0..1 of any size."""
+    rng = np.random.default_rng(seed)
+    fy, fx = np.fft.fftfreq(h)[:, None], np.fft.fftfreq(w)[None, :]
+    out = np.zeros((h, w))
+    for i, s in enumerate(sigmas):
+        k = np.exp(-2 * (math.pi * s) ** 2 * (fy ** 2 + fx ** 2))
+        layer = np.real(np.fft.ifft2(np.fft.fft2(rng.standard_normal((h, w))) * k))
+        out += norm01(layer) / (i + 1) ** 0.9
+    return norm01(out).astype(np.float32)
+
+
+# --- 3D -> PNG
+def _temp_asset(ref):
+    """(collection, objects, cleanup) for an asset of this script or 'Pack/Asset'."""
+    if "/" in ref:
+        coll = _collection_for(ref)
+        objs = [o for o in coll.all_objects if "__Collider__" not in o.name]
+        return coll, objs, lambda: None
+    fns = dict(ASSETS)
+    if ref not in fns:
+        raise KeyError(f"нет ассета {ref}: объяви @asset выше вызова icon()")
+    coll = bpy.data.collections.new("_icon_" + ref)
+    bpy.context.scene.collection.children.link(coll)
+    B = Builder(ref)
+    fns[ref](B)
+    objs = [o for o in B.build(coll) if "__Collider__" not in o.name]
+
+    def cleanup():
+        for o in list(coll.objects):
+            bpy.data.objects.remove(o)
+        bpy.data.collections.remove(coll)
+    return coll, objs, cleanup
+
+
+def _icon_render(src, size, view, fill_, style, tilt):
+    scn = bpy.context.scene
+    coll, objs, cleanup = _temp_asset(src)
+    hidden = []
+    for ob in bpy.data.objects:
+        if ob not in objs and not ob.hide_render and ob.type in ("MESH", "EMPTY", "CURVE", "FONT"):
+            ob.hide_render = True
+            hidden.append(ob)
+    st = bpy.data.collections.new("_iconrig")
+    scn.collection.children.link(st)
+    try:
+        if view == "icon":
+            yaw, pitch = -35.0, 22.0
+        elif view == "front":
+            yaw, pitch = 0.0, 0.0
+        else:
+            yaw, pitch = view
+        # Camera looks along d (from front-left-above towards the model, face -Y).
+        d = (Matrix.Rotation(math.radians(yaw), 3, "Z") @ Matrix.Rotation(math.radians(-pitch), 3, "X")
+             @ Vector((0, 1, 0))).normalized()
+        rot = d.to_track_quat("-Z", "Y")
+        if tilt:
+            rot = rot @ Euler((0, 0, math.radians(tilt))).to_quaternion()
+        Rm = rot.to_matrix()
+        right, up = Rm @ Vector((1, 0, 0)), Rm @ Vector((0, 1, 0))
+        pts = [ob.matrix_world @ Vector(c) for ob in objs for c in ob.bound_box]
+        xs, ys = [p.dot(right) for p in pts], [p.dot(up) for p in pts]
+        cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+        extent = max(max(xs) - min(xs), max(ys) - min(ys))
+        lo, hi = bounds(objs)
+        radius = (hi - lo).length + 1
+        cd = bpy.data.cameras.new("IconCam")
+        cd.type = "ORTHO"
+        cd.ortho_scale = extent / max(fill_, 0.1)
+        cam = bpy.data.objects.new("IconCam", cd)
+        cam.location = right * cx + up * cy - d * radius * 3
+        cam.rotation_euler = rot.to_euler()
+        cd.clip_start, cd.clip_end = 0.01, radius * 8
+        st.objects.link(cam)
+        scn.camera = cam
+        world = bpy.data.worlds.new("IconWorld")
+        world.use_nodes = True
+        wb = world.node_tree.nodes["Background"]
+        wb.inputs["Color"].default_value = (0.8, 0.84, 0.9, 1)
+        wb.inputs["Strength"].default_value = 0.55 if style != "flat" else 1.0
+        scn.world = world
+        scn.render.film_transparent = True
+        scn.render.resolution_x = scn.render.resolution_y = size * 2
+        try:
+            scn.view_settings.view_transform = "Standard"
+            scn.view_settings.look = "None"
+        except Exception:
+            pass
+        if style == "flat":
+            scn.render.engine = "BLENDER_WORKBENCH"
+            scn.display.shading.light = "FLAT"
+            scn.display.shading.color_type = "MATERIAL"
+        else:
+            scn.render.engine = engine_id()
+            for attr, val in (("taa_render_samples", 48), ("use_shadows", True)):
+                try:
+                    setattr(scn.eevee, attr, val)
+                except Exception:
+                    pass
+            # Studio: warm key upper left, cool fill right, white rim from behind.
+            for nm, energy, col, ang in (("Key", 4.0, (1.0, 0.93, 0.84), (50, 0, -40)),
+                                         ("Fill", 1.6, (0.78, 0.86, 1.0), (60, 0, 70)),
+                                         ("Rim", 3.0, (1.0, 1.0, 1.0), (-55, 0, 180))):
+                ld = bpy.data.lights.new(nm, "SUN")
+                ld.energy, ld.color, ld.angle = energy, col, math.radians(8)
+                lo_ = bpy.data.objects.new(nm, ld)
+                lo_.rotation_euler = tuple(math.radians(a) for a in ang)
+                st.objects.link(lo_)
+        tmp = os.path.join(OUT, "_icon_tmp.png")
+        scn.render.filepath = tmp
+        os.makedirs(OUT, exist_ok=True)
+        bpy.ops.render.render(write_still=True)
+        img = bpy.data.images.load(tmp)
+        n = size * 2
+        px = np.array(img.pixels[:], dtype=np.float32).reshape(n, n, 4)[::-1].copy()
+        bpy.data.images.remove(img)
+        os.remove(tmp)
+        return px
+    finally:
+        for ob in hidden:
+            ob.hide_render = False
+        for ob in list(st.objects):
+            bpy.data.objects.remove(ob)
+        bpy.data.collections.remove(st)
+        cleanup()
+        scn.render.film_transparent = False
+
+
+def _dilate(a, r):
+    out = a.copy()
+    rr = int(math.ceil(r))
+    for dy in range(-rr, rr + 1):
+        for dx in range(-rr, rr + 1):
+            if dx * dx + dy * dy <= r * r:
+                out = np.maximum(out, np.roll(a, (dy, dx), axis=(0, 1)))
+    return out
+
+
+def icon_img(name, src=None, size=256, view="icon", outline=6, fill=0.78, style="studio",
+             glow=None, tilt=0, outline_col="#12284A"):
+    """Renders 3D asset `src` (this script or 'Pack/Asset') to a straight-alpha numpy icon."""
+    src = src or name
+    px = _icon_render(src, size, view, fill, style, tilt)  # 2x
+    a = px[..., 3]
+    rgba = px
+    if outline:
+        ring = _gauss(_dilate((a > 0.5).astype(np.float32), outline * 2), 1.0)
+        oc = _col(outline_col)
+        base = np.zeros_like(px)
+        base[..., :3] = oc[:3]
+        base[..., 3] = np.clip(ring, 0, 1) * oc[3]
+        # render over the outline
+        pa = px[..., 3:4]
+        rgb = px[..., :3] * pa + base[..., :3] * base[..., 3:4] * (1 - pa)
+        aa = pa + base[..., 3:4] * (1 - pa)
+        rgba = np.concatenate([rgb / np.maximum(aa, 1e-4), aa], -1)
+    if glow:
+        gc = _col(glow)
+        halo = _gauss(rgba[..., 3], size * 0.06) * 0.6 * gc[3]
+        pa = rgba[..., 3:4]
+        rgb = rgba[..., :3] * pa + gc[:3][None, None] * halo[..., None] * (1 - pa)
+        aa = pa + halo[..., None] * (1 - pa)
+        rgba = np.concatenate([rgb / np.maximum(aa, 1e-4), aa], -1)
+    pre = np.concatenate([rgba[..., :3] * rgba[..., 3:4], rgba[..., 3:4]], -1)
+    pre = _down(pre, 2)
+    a = pre[..., 3:4]
+    rgb = np.where(a > 1e-4, pre[..., :3] / np.maximum(a, 1e-4), 0)
+    return np.concatenate([np.clip(rgb, 0, 1), np.clip(a, 0, 1)], -1).astype(np.float32)
+
+
+def icon(name, src=None, size=256, view="icon", outline=6, fill=0.78, style="studio", glow=None,
+         tilt=0, outline_col="#12284A"):
+    """Renders 3D asset `src` to PNG `name` (size x size, transparent)."""
+    try:
+        img = icon_img(name, src, size, view, outline, fill, style, glow, tilt, outline_col)
+    except Exception as e:  # one broken icon never stops the pack
+        UI_LINES.append(f"ERROR icon {name}: {e!r}")
+        return None
+    C = Canvas(size, size, 1)
+    C.paste(img, 0, 0)
+    _ui_save(name, C.image())
+    return img
+
+
+def text3d(bm, text, size=1.0, depth=0.3, bevel=0.03, weight=0.0, track=0.0, align="CENTER",
+           at=(0, 0, 0)):
+    """Letters in the XZ plane, face -Y, baseline on z = at.z, depth along Y. Merged into bm."""
+    cu = bpy.data.curves.new("_txt", "FONT")
+    cu.body = text
+    font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Inter-Bold.ttf")
+    if os.path.exists(font_path):
+        try:
+            cu.font = bpy.data.fonts.load(font_path, check_existing=True)
+        except Exception:
+            pass
+    cu.size = size
+    cu.extrude = depth / 2
+    cu.bevel_depth = bevel
+    cu.offset = weight
+    cu.space_character = 1.0 + track
+    cu.align_x = align
+    ob = bpy.data.objects.new("_txt", cu)
+    bpy.context.scene.collection.objects.link(ob)
+    bpy.context.view_layer.update()
+    dg = bpy.context.evaluated_depsgraph_get()
+    me = bpy.data.meshes.new_from_object(ob.evaluated_get(dg))
+    tmp = bmesh.new()
+    tmp.from_mesh(me)
+    M = T(*at) @ Matrix.Rotation(math.radians(90), 4, "X")
+    bmesh.ops.transform(tmp, matrix=M, verts=tmp.verts)
+    bpy.data.objects.remove(ob)
+    bpy.data.curves.remove(cu)
+    bpy.data.meshes.remove(me)
+    return merge(bm, tmp)
+
+
+def _ui_sheet(path):
+    """Every PNG of the pack on light glass, dark glass and a checker, plus a 32 px copy."""
+    if not UI_PNGS:
+        return
+    cell = 160
+    rows = len(UI_PNGS)
+    sheet = np.ones((rows * cell, cell * 4, 4), dtype=np.float32)
+    bgs = [np.array([0.90, 0.93, 0.97]), np.array([0.10, 0.14, 0.20])]
+    yy, xx = np.mgrid[0:cell, 0:cell]
+    checker = np.where(((yy // 10) + (xx // 10)) % 2 == 0, 0.75, 0.55)[..., None] * np.ones(3)
+    for i, (_n, img) in enumerate(UI_PNGS):
+        h, w = img.shape[:2]
+        k = min((cell - 16) / w, (cell - 16) / h)
+        ys = np.clip(((np.arange(int(h * k)) + 0.5) / k).astype(int), 0, h - 1)
+        xs = np.clip(((np.arange(int(w * k)) + 0.5) / k).astype(int), 0, w - 1)
+        small = img[ys][:, xs]
+        sh, sw = small.shape[:2]
+        tiny_k = 32 / max(w, h)
+        ty = np.clip(((np.arange(max(1, int(h * tiny_k))) + 0.5) / tiny_k).astype(int), 0, h - 1)
+        tx = np.clip(((np.arange(max(1, int(w * tiny_k))) + 0.5) / tiny_k).astype(int), 0, w - 1)
+        tiny = img[ty][:, tx]
+        for j, bg in enumerate([bgs[0], bgs[1], None, bgs[0]]):
+            tile = np.zeros((cell, cell, 3)) + (checker if bg is None else bg)
+            src = tiny if j == 3 else small
+            ph, pw = src.shape[:2]
+            oy, ox = (cell - ph) // 2, (cell - pw) // 2
+            a = src[..., 3:4]
+            tile[oy:oy + ph, ox:ox + pw] = src[..., :3] * a + tile[oy:oy + ph, ox:ox + pw] * (1 - a)
+            sheet[i * cell:(i + 1) * cell, j * cell:(j + 1) * cell, :3] = tile
+    h, w = sheet.shape[:2]
+    out = bpy.data.images.new("ui_sheet", w, h, alpha=True)
+    out.pixels.foreach_set(np.ascontiguousarray(sheet[::-1]).ravel())
+    out.filepath_raw = path
+    out.file_format = "PNG"
+    out.save()
+
+
 __all__ = ["box", "cyl", "ball", "lathe", "torus", "sweep", "prism", "leg", "T", "euler", "bm_new",
            "merge", "xf", "Rng", "asset", "run", "png", "shot", "fbm", "blur", "norm01", "scratches", "specks",
            "MAT_DEF", "Matrix", "Vector", "math", "np",
-           "rrect", "arcpts", "soften", "displace", "mirror_x", "blur2", "emblem"]
+           "rrect", "arcpts", "soften", "displace", "mirror_x", "blur2", "emblem",
+           "canvas", "Canvas", "sd_circle", "sd_rrect", "sd_seg", "sd_arc", "sd_poly", "sd_union",
+           "sd_sub", "sd_round", "fill", "stroke", "lin_grad", "rad_grad", "noise", "icon", "icon_img",
+           "text3d"]
