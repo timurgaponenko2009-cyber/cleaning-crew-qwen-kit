@@ -81,12 +81,14 @@ MAT_DEF = {
 MATS = {}
 
 
-def mat(name):
-    if name in MATS:
-        return MATS[name]
+def mat(name, label=None):
+    """Material `name`; `label` ("Paint~2") is its own copy for a per-part wear level."""
+    label = label or name
+    if label in MATS:
+        return MATS[label]
     rgb, metal, rough, _pattern, extra = MAT_DEF[name]
     col = srgb(*rgb)
-    m = bpy.data.materials.new(name)
+    m = bpy.data.materials.new(label)
     m.use_nodes = True
     m.diffuse_color = col
     nt = m.node_tree
@@ -103,7 +105,7 @@ def mat(name):
             m.surface_render_method = "BLENDED"
         except Exception:
             pass
-    MATS[name] = m
+    MATS[label] = m
     return m
 
 
@@ -292,7 +294,20 @@ def save_png(path, rgba):
 GRIME_COL = np.array([0.18, 0.15, 0.12])
 
 
-def make_textures(name):
+def make_textures(name, label=None, wear=None):
+    """Textures of material `name`, saved as <label>_*.png; `wear` 0..1 overrides the pack level."""
+    global WEAR
+    label = label or name
+    keep = WEAR
+    if wear is not None:
+        WEAR = wear
+    try:
+        return _make_textures(name, label)
+    finally:
+        WEAR = keep
+
+
+def _make_textures(name, label):
     rgb, metal, rough, kind, extra = MAT_DEF[name]
     base = np.array(rgb) / 255.0
     shade, height, rough_off, grime = pattern(kind)
@@ -321,12 +336,12 @@ def make_textures(name):
     os.makedirs(TEX_DIR, exist_ok=True)
     out = {}
     for tag, arr in (("albedo", albedo), ("normal", normal), ("rough", rough_img)):
-        out[tag] = save_png(os.path.join(TEX_DIR, f"{name}_{tag}.png"), arr)
+        out[tag] = save_png(os.path.join(TEX_DIR, f"{label}_{tag}.png"), arr)
     return out
 
 
-def hook_textures(name, imgs):
-    m = mat(name)
+def hook_textures(name, imgs, label=None):
+    m = mat(name, label)
     nt = m.node_tree
     b = nt.nodes.get("Principled BSDF")
     ta = nt.nodes.new("ShaderNodeTexImage")
@@ -529,6 +544,49 @@ def mirror_x(bm):
     return bm
 
 
+def _drop_pts(cx, cz, r, n=14):
+    """Teardrop outline (point up), counter-clockwise, seen from -Y."""
+    pts = []
+    for i in range(n + 1):
+        a = math.radians(150 + 240 * i / n)  # round bottom: 150 -> 390 degrees
+        pts.append((cx + r * math.cos(a), cz + r * math.sin(a) * 0.95))
+    return pts + [(cx, cz + r * 1.9)]  # the tip on top
+
+
+def _star_pts(cx, cz, r, inner=0.28, n=4, rot=45):
+    pts = []
+    for i in range(n * 2):
+        rr = r if i % 2 == 0 else r * inner
+        a = math.radians(rot + 90 + 180 * i / n)
+        pts.append((cx + rr * math.cos(a), cz + rr * math.sin(a)))
+    return pts
+
+
+def emblem(c, d, depth=0.08, face="-Y"):
+    """The CLEANING CREW emblem (one design everywhere): returns bmeshes
+    {"badge": disc, "drop": water drop, "bubble": ring, "spark": four-point glint}.
+    c = centre of the badge's back face, d = badge diameter; the emblem looks along
+    -Y (face="-Y") or +Y ("+Y"); for walls along X turn it with xf(bm, ...).
+    Suggested materials: badge BrandNavy or BrandWhite, drop BrandTeal,
+    bubble BrandWhite, spark NeonWhite or BrandWhite."""
+    x, y, z = c
+    sgn = -1 if face == "-Y" else 1
+    r = d / 2
+    def slab(pts, layer):
+        y0 = y + sgn * (depth * layer)
+        y1 = y + sgn * (depth * (layer + 1))
+        return prism(bm_new(), pts, min(y0, y1), max(y0, y1), r=min(0.02, depth * 0.3))
+    circle = [(x + r * math.cos(math.radians(a)), z + r * math.sin(math.radians(a))) for a in range(0, 360, 10)]
+    out = {"badge": slab(circle, 0)}
+    out["drop"] = slab(_drop_pts(x - r * 0.08, z - r * 0.22, r * 0.36), 1)
+    ring = bm_new()
+    torus(ring, (x + r * 0.42, y + sgn * depth * 1.5, z + r * 0.36), r * 0.17, r * 0.035,
+          m=euler(90, 0, 0), segs=24, ring=8)
+    out["bubble"] = ring
+    out["spark"] = slab(_star_pts(x - r * 0.4, z + r * 0.42, r * 0.16), 1)
+    return out
+
+
 class Rng:
     def __init__(self, seed):
         self.s = seed
@@ -547,6 +605,7 @@ class Builder:
         self.parts = {}
         self.flat = set()
         self.tile = {}
+        self.wear = {}
 
     def mark(self, name, pos, dir=None):
         """A named point for the game: prompt, screen centre, wheel centre, shelf,
@@ -561,7 +620,7 @@ class Builder:
             "range": range, "brightness": brightness, "angle": angle, "shadows": shadows}
 
     def add(self, part, material, src, anim=None, pivot=None, axis="Z", speed=None,
-            flat=False, tile=None, dist=None, angle=None, period=None, phase=None):
+            flat=False, tile=None, dist=None, angle=None, period=None, phase=None, wear=None):
         """anim: "spin" | "swing" | "slide" | "blink" | "sway" -- a moving part.
         pivot: rotation point / hinge in asset coordinates; axis: "X" | "Y" | "Z"
         (for slide: the direction); speed: turns per second or a period, optional.
@@ -574,6 +633,8 @@ class Builder:
             self.flat.add(key)
         if tile:  # studs per texture repeat for this part (small tools: 0.5-1)
             self.tile[key] = tile
+        if wear is not None:  # 0 = new, 1 = old; overrides run(wear=...) for this part
+            self.wear[key] = max(0.0, min(1.0, float(wear)))
         if anim:
             info = {"anim": anim, "pivot": list(pivot) if pivot else None, "axis": axis, "speed": speed}
             for k, v in (("dist", dist), ("angle", angle), ("period", period), ("phase", phase)):
@@ -609,7 +670,8 @@ class Builder:
             me = bpy.data.meshes.new(name)
             bm.to_mesh(me)
             bm.free()
-            me.materials.append(mat(material))
+            w = self.wear.get((part, material))
+            me.materials.append(mat(material, None if w is None else f"{material}~{round(w * 10)}"))
             ob = bpy.data.objects.new(name, me)
             coll.objects.link(ob)
             objs.append(ob)
@@ -1108,8 +1170,10 @@ def run(pack, preview=True, textures=True, wear="worn"):
     used = sorted({ob.name.split("__")[-1] for objs in per_asset.values() for ob in objs})
     if textures:
         TEX_DIR = os.path.join(OUT, "tex")
-        for m in used:
-            hook_textures(m, make_textures(m))
+        labels = sorted({ob.data.materials[0].name for objs in per_asset.values() for ob in objs})
+        for label in labels:
+            base, _, lvl = label.partition("~")
+            hook_textures(base, make_textures(base, label, int(lvl) / 10 if lvl else None), label)
     for a, objs in per_asset.items():
         lo, hi = bounds(objs)
         s = hi - lo
@@ -1334,4 +1398,4 @@ def png(name, rgba):
 __all__ = ["box", "cyl", "ball", "lathe", "torus", "sweep", "prism", "leg", "T", "euler", "bm_new",
            "merge", "xf", "Rng", "asset", "run", "png", "shot", "fbm", "blur", "norm01", "scratches", "specks",
            "MAT_DEF", "Matrix", "Vector", "math", "np",
-           "rrect", "arcpts", "soften", "displace", "mirror_x", "blur2"]
+           "rrect", "arcpts", "soften", "displace", "mirror_x", "blur2", "emblem"]
