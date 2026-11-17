@@ -30,10 +30,10 @@ T0 = time.time()
 OUT = os.environ.get("CC_OUT", os.path.join(os.getcwd(), "out"))
 TEX_DIR = os.path.join(OUT, "tex")
 RES = int(os.environ.get("CC_RES", "1600"))
-MAX_OBJECTS = 40
+MAX_OBJECTS = 60
 TILE = 4.0  # studs per texture repeat
 TEX = int(os.environ.get("CC_TEX", "512"))
-PREFIXES = ("HB_", "OF_", "TK_", "TR_", "FX_", "UI_", "CC_", "Crew")
+PREFIXES = ("HB_", "OF_", "TK_", "TR_", "FX_", "UI_", "CC_", "FH_", "Crew")
 
 def srgb(r, g, b):
     def lin(c):
@@ -154,9 +154,32 @@ def specks(count, size=1.5):
     return np.clip(blur(img, size) * size * 6, 0, 1)
 
 
+# How worn the pack looks (owner 17.11: the HUB is a new, clean, premium
+# company; wear and dirt belong to the missions). run(pack, wear=...) sets it.
+WEAR_LEVELS = {"clean": 0.12, "used": 0.5, "worn": 1.0}
+WEAR = 1.0
+
+
+def blur2(a, sx, sy):
+    """Tileable anisotropic gaussian blur: sx across the columns, sy along the rows."""
+    n = a.shape[0]
+    f = np.fft.fftfreq(n)
+    k = np.exp(-2 * math.pi ** 2 * ((sx * f[None, :]) ** 2 + (sy * f[:, None]) ** 2))
+    return np.real(np.fft.ifft2(np.fft.fft2(a) * k))
+
+
+def grime_map():
+    """Dirt that reads as weathering, not camouflage: thin streaks run down the
+    walls (rows = height on the box-projected sides), soft patches stay faint."""
+    streaks = norm01(blur2(RNG_TEX.standard_normal((TEX, TEX)), 2.5, 80))
+    streaks = np.clip((streaks - 0.56) * 2.4, 0, 1)
+    patches = fbm((96, 48, 24)) ** 2.8
+    return np.clip(streaks * 0.75 + patches * 0.4, 0, 1) * WEAR
+
+
 def pattern(kind):
     """Returns (shade multiplier ~1, height 0..1, roughness offset, grime 0..1)."""
-    grime = fbm((96, 48, 24, 12)) ** 2.2
+    grime = grime_map()
     if kind == "wood":
         warp = fbm((48, 24, 12)) * 18
         yy = np.arange(TEX)[:, None] + warp
@@ -250,7 +273,7 @@ def pattern(kind):
         shade = 0.75 + 0.35 * n - veins * 0.1
         return shade, veins * 0.3, 0.0, grime
     if kind == "paint":
-        chips = np.clip((fbm((24, 12, 6, 3)) - 0.72) * 6, 0, 1)
+        chips = np.clip((fbm((24, 12, 6, 3)) - 0.72) * 6, 0, 1) * min(1.0, WEAR * 1.2)
         n = fbm((32, 12))
         shade = 0.88 + 0.12 * n
         return shade, -chips * 0.5 + n * 0.1, chips * 0.3, grime
@@ -461,6 +484,51 @@ def leg(bm, x, y, h, rt=0.09, rb=0.07, z0=0.0, segs=10):
     return cyl(bm, (x, y, z0), (x, y, z0 + h), rb, rt, segs)
 
 
+def rrect(w, h, r, n=6, cx=0.0, cz=0.0):
+    """Rounded rectangle outline (counter-clockwise) for prism(): signs, panels, screens."""
+    r = min(r, w / 2, h / 2)
+    pts = []
+    for qx, qz, a0 in ((1, 1, 0), (-1, 1, 90), (-1, -1, 180), (1, -1, 270)):
+        ox, oz = cx + qx * (w / 2 - r), cz + qz * (h / 2 - r)
+        for i in range(n + 1):
+            a = math.radians(a0 + 90 * i / n)
+            pts.append((ox + r * math.cos(a), oz + r * math.sin(a)))
+    return pts
+
+
+def arcpts(cx, cz, r, a0, a1, n=16):
+    """Points on an arc (degrees, counter-clockwise): arches, livery waves, wheel sectors."""
+    return [(cx + r * math.cos(math.radians(a0 + (a1 - a0) * i / n)),
+             cz + r * math.sin(math.radians(a0 + (a1 - a0) * i / n))) for i in range(n + 1)]
+
+
+def soften(bm, levels=1, smooth=0.6):
+    """Subdivide and relax: cushions, bags, rags, mop strands, organic shapes."""
+    for _ in range(levels):
+        bmesh.ops.subdivide_edges(bm, edges=bm.edges[:], cuts=1, use_grid_fill=True)
+        bmesh.ops.smooth_vert(bm, verts=bm.verts[:], factor=smooth, use_axis_x=True,
+                              use_axis_y=True, use_axis_z=True)
+    return bm
+
+
+def displace(bm, amp=0.05, scale=0.5, seed=1):
+    """Crumple: moves every vertex along its normal by smooth noise (fabric, paper, bags, foil)."""
+    bm.normal_update()
+    for v in bm.verts:
+        p = v.co * (1.0 / max(scale, 1e-3))
+        n = (math.sin(p.x * 1.7 + seed) * math.cos(p.y * 2.3 - seed) * math.sin(p.z * 1.9 + seed * 0.7)
+             + 0.5 * math.sin(p.x * 4.1 - p.z * 3.3 + seed * 1.3))
+        v.co += v.normal * (amp * n)
+    return bm
+
+
+def mirror_x(bm):
+    """Mirror across X (left glove from the right one) with normals kept outward."""
+    bmesh.ops.transform(bm, matrix=Matrix.Scale(-1, 4, (1, 0, 0)), verts=bm.verts[:])
+    bmesh.ops.reverse_faces(bm, faces=bm.faces[:])
+    return bm
+
+
 class Rng:
     def __init__(self, seed):
         self.s = seed
@@ -477,8 +545,23 @@ class Builder:
     def __init__(self, asset):
         self.asset = asset
         self.parts = {}
+        self.flat = set()
+        self.tile = {}
 
-    def add(self, part, material, src, anim=None, pivot=None, axis="Z", speed=None):
+    def mark(self, name, pos, dir=None):
+        """A named point for the game: prompt, screen centre, wheel centre, shelf,
+        steam or leaf emitter. Written to markers.json and a MARK line."""
+        MARKS.setdefault(self.asset, {})[name] = {"pos": list(pos), "dir": list(dir) if dir else None}
+
+    def light(self, name, kind, pos, dir=(0, -1, 0), color=(255, 236, 210), range=16,
+              brightness=1.5, angle=60, shadows=False):
+        """A Roblox light: kind "point" | "spot" | "surface". Written to lights.json."""
+        LIGHTS.setdefault(self.asset, {})[name] = {
+            "kind": kind, "pos": list(pos), "dir": list(dir), "color": list(color),
+            "range": range, "brightness": brightness, "angle": angle, "shadows": shadows}
+
+    def add(self, part, material, src, anim=None, pivot=None, axis="Z", speed=None,
+            flat=False, tile=None, dist=None, angle=None, period=None, phase=None):
         """anim: "spin" | "swing" | "slide" | "blink" | "sway" -- a moving part.
         pivot: rotation point / hinge in asset coordinates; axis: "X" | "Y" | "Z"
         (for slide: the direction); speed: turns per second or a period, optional.
@@ -487,9 +570,16 @@ class Builder:
         if key not in self.parts:
             self.parts[key] = bm_new()
         merge(self.parts[key], src)
+        if flat:  # faceted look: every edge hard (crystal foliage, low-poly rocks)
+            self.flat.add(key)
+        if tile:  # studs per texture repeat for this part (small tools: 0.5-1)
+            self.tile[key] = tile
         if anim:
-            ANIM.setdefault(self.asset, {})[part] = {
-                "anim": anim, "pivot": list(pivot) if pivot else None, "axis": axis, "speed": speed}
+            info = {"anim": anim, "pivot": list(pivot) if pivot else None, "axis": axis, "speed": speed}
+            for k, v in (("dist", dist), ("angle", angle), ("period", period), ("phase", phase)):
+                if v is not None:
+                    info[k] = v
+            ANIM.setdefault(self.asset, {})[part] = info
 
     def build(self, coll):
         objs = []
@@ -497,10 +587,12 @@ class Builder:
             bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
             bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
             # Sharp corners keep hard normals, bevels shade smooth.
+            limit = 0.0 if (part, material) in self.flat else math.radians(38)
             sharp = [e for e in bm.edges if len(e.link_faces) == 2 and
-                     e.calc_face_angle(0) > math.radians(38)]
+                     e.calc_face_angle(0) > limit]
             bmesh.ops.split_edges(bm, edges=sharp)
             uv = bm.loops.layers.uv.new("UVMap")
+            tile = self.tile.get((part, material), TILE)
             for face in bm.faces:
                 face.smooth = True
                 nx, ny, nz = (abs(c) for c in face.normal)
@@ -512,7 +604,7 @@ class Builder:
                         u, v = p.y, p.z
                     else:
                         u, v = p.x, p.z
-                    loop[uv].uv = (u / TILE, v / TILE)
+                    loop[uv].uv = (u / tile, v / tile)
             name = f"{self.asset}__{part}__{material}"
             me = bpy.data.meshes.new(name)
             bm.to_mesh(me)
@@ -553,15 +645,114 @@ MAT_DEF.update({
     "Flower": ((214, 92, 70), 0.0, 0.6, "plastic", {}),  # warm flower heads
 })
 
+# ------------------------------------------------------------------ clean HUB and brand (17.11)
+# The HUB is the crew's new, clean company campus: brand navy, turquoise and
+# white, dark powder-coated frames, rendered facades, LED light; bright
+# plastics for the products in the store.
+MAT_DEF.update({
+    "BrandWhite": ((236, 238, 236), 0.0, 0.32, "paint", {}),   # van body, fascias, kiosks
+    "BrandNavy": ((30, 46, 70), 0.1, 0.4, "paint", {}),        # company navy (HQ, signs, uniforms)
+    "BrandTeal": ((46, 160, 156), 0.1, 0.4, "paint", {}),      # company turquoise (livery, trims)
+    "PowderCoat": ((58, 64, 72), 0.4, 0.45, "paint", {}),      # dark frames, posts, rails, benches
+    "Stucco": ((222, 218, 210), 0.0, 0.88, "concrete", {}),    # clean rendered facade walls
+    "Composite": ((206, 208, 210), 0.3, 0.38, "paint", {}),    # aluminium composite cladding panels
+    "Acrylic": ((226, 236, 240), 0.0, 0.25, "glass", {"alpha": 0.7}),  # frosted light boxes, signs
+    "NeonTeal": ((90, 235, 225), 0.0, 0.3, "flat", {"emit": 5.0}),     # brand neon, light lines
+    "LightCool": ((235, 245, 255), 0.0, 0.3, "flat", {"emit": 3.0}),   # LED panels, cool light
+    "BottleBlue": ((58, 128, 214), 0.0, 0.3, "plastic", {}),   # product bottles and canisters
+    "BottleGreen": ((84, 176, 92), 0.0, 0.3, "plastic", {}),
+    "BottleYellow": ((238, 198, 64), 0.0, 0.3, "plastic", {}),
+    "BottlePink": ((228, 112, 160), 0.0, 0.3, "plastic", {}),
+    "SpongeYellow": ((240, 208, 84), 0.0, 0.9, "speckle", {}), # sponges, foam pads
+    "Microfiber": ((70, 140, 200), 0.0, 0.95, "fabric", {}),   # cloths, mop heads
+})
+
+# ------------------------------------------------------------------ 17.11 full list (all four briefs)
+# Synonyms from the briefs (Powder = PowderCoat, CleanWhite = BrandWhite ...) keep their own names
+# so every brief stays valid. Roblox look: tools/assemble_qwen_pack.luau PALETTE (same list).
+MAT_DEF.update({
+    "BrandBlue": ((29, 95, 208), 0.1, 0.4, "paint", {}),
+    "BrandLime": ((181, 222, 58), 0.1, 0.45, "paint", {}),
+    "BrandAqua": ((141, 235, 227), 0.1, 0.4, "paint", {}),
+    "BrandMist": ((227, 234, 244), 0.0, 0.5, "paint", {}),
+    "CleanWhite": ((236, 238, 236), 0.0, 0.32, "paint", {}),
+    "Powder": ((58, 64, 72), 0.4, 0.45, "paint", {}),
+    "PowderGraphite": ((54, 58, 64), 0.3, 0.55, "paint", {}),
+    "Facade": ((214, 218, 220), 0.5, 0.32, "paint", {}),
+    "Cedar": ((176, 116, 72), 0.0, 0.5, "wood", {}),
+    "LightConcrete": ((206, 204, 198), 0.0, 0.85, "concrete", {}),
+    "Plaster": ((230, 226, 218), 0.0, 0.9, "concrete", {}),
+    "Stone": ((150, 148, 142), 0.0, 0.3, "speckle", {}),
+    "Siding": ((220, 222, 216), 0.0, 0.6, "paint", {}),
+    "PaintedWood": ((226, 222, 212), 0.0, 0.55, "paint", {}),
+    "RoofShingle": ((70, 66, 64), 0.0, 0.9, "concrete", {}),
+    "Terracotta": ((178, 96, 62), 0.0, 0.7, "ceramic", {}),
+    "Gold": ((232, 186, 84), 0.9, 0.3, "metal", {}),
+    "CoinGold": ((240, 196, 80), 0.9, 0.3, "metal", {}),
+    "GlossPlastic": ((240, 240, 240), 0.0, 0.2, "plastic", {}),
+    "Linen": ((214, 206, 190), 0.0, 0.95, "fabric", {}),
+    "Velvet": ((96, 60, 90), 0.0, 0.95, "fabric", {}),
+    "Cotton": ((232, 228, 218), 0.0, 0.95, "fabric", {}),
+    "Bristle": ((40, 40, 44), 0.0, 0.8, "plastic", {}),
+    "Nitrile": ((70, 110, 200), 0.0, 0.6, "rubber", {}),
+    "Sponge": ((240, 208, 84), 0.0, 0.9, "speckle", {}),
+    "SpongeFoam": ((240, 208, 84), 0.0, 0.9, "speckle", {}),
+    "Scour": ((60, 140, 80), 0.0, 0.95, "fabric", {}),
+    "ClearGlass": ((200, 220, 228), 0.0, 0.08, "glass", {'alpha': 0.25}),
+    "TintGlass": ((60, 74, 84), 0.0, 0.1, "glass", {'alpha': 0.6}),
+    "ClearPlastic": ((220, 232, 240), 0.0, 0.2, "glass", {'alpha': 0.5}),
+    "GemCrystal": ((120, 230, 220), 0.0, 0.05, "glass", {'alpha': 0.85}),
+    "Water": ((120, 170, 190), 0.0, 0.05, "glass", {'alpha': 0.5}),
+    "WaterDirty": ((110, 104, 80), 0.0, 0.1, "glass", {'alpha': 0.75}),
+    "Liquid": ((90, 170, 220), 0.0, 0.15, "plastic", {}),
+    "LiquidDirty": ((100, 90, 60), 0.0, 0.2, "plastic", {}),
+    "Opal": ((240, 242, 240), 0.0, 0.5, "glass", {'alpha': 0.85, 'emit': 0.6}),
+    "NeonWhite": ((220, 240, 255), 0.0, 0.3, "flat", {'emit': 5.0}),
+    "LightCold": ((214, 228, 255), 0.0, 0.3, "flat", {'emit': 3.0}),
+    "CoolLED": ((214, 228, 255), 0.0, 0.3, "flat", {'emit': 3.0}),
+    "WarmLED": ((255, 196, 140), 0.0, 0.3, "flat", {'emit': 3.0}),
+    "LedGlow": ((120, 240, 200), 0.0, 0.3, "flat", {'emit': 4.0}),
+    "NeonLime": ((200, 255, 80), 0.0, 0.3, "flat", {'emit': 5.0}),
+    "NeonGold": ((255, 200, 90), 0.0, 0.3, "flat", {'emit': 5.0}),
+    "NeonGreen": ((110, 240, 140), 0.0, 0.3, "flat", {'emit': 5.0}),
+    "NeonBlue": ((90, 160, 255), 0.0, 0.3, "flat", {'emit': 5.0}),
+    "NeonPurple": ((190, 120, 255), 0.0, 0.3, "flat", {'emit': 5.0}),
+    "RarityGreen": ((72, 196, 104), 0.1, 0.4, "paint", {}),
+    "RarityBlue": ((58, 132, 236), 0.1, 0.4, "paint", {}),
+    "RarityPurple": ((156, 88, 228), 0.1, 0.4, "paint", {}),
+    "LeafLight": ((128, 176, 84), 0.0, 0.7, "leaf", {}),
+    "LeafAutumn": ((222, 120, 48), 0.0, 0.7, "leaf", {}),
+    "LeafGold": ((232, 184, 64), 0.0, 0.7, "leaf", {}),
+    "LeafRed": ((188, 64, 48), 0.0, 0.7, "leaf", {}),
+    "FlowerPink": ((232, 120, 160), 0.0, 0.6, "plastic", {}),
+    "FlowerWhite": ((240, 236, 226), 0.0, 0.6, "plastic", {}),
+    "FlowerYellow": ((240, 200, 70), 0.0, 0.6, "plastic", {}),
+    "FlowerViolet": ((140, 100, 200), 0.0, 0.6, "plastic", {}),
+    "Birch": ((226, 222, 212), 0.0, 0.8, "bark", {}),
+    "FarRock": ((104, 112, 128), 0.0, 0.9, "flat", {}),
+    "FarRockLight": ((150, 156, 170), 0.0, 0.9, "flat", {}),
+    "FarSnow": ((238, 242, 248), 0.0, 0.9, "flat", {}),
+    "FarForest": ((52, 80, 70), 0.0, 0.9, "flat", {}),
+    "FarHaze": ((170, 180, 196), 0.0, 0.9, "flat", {}),
+    "FarBuild": ((120, 128, 140), 0.0, 0.9, "flat", {}),
+    "FarWindow": ((255, 214, 160), 0.0, 0.3, "flat", {'emit': 1.5}),
+})
+
 # ------------------------------------------------------------------ assets
 ASSETS = []
-ANIM = {}  # asset -> part -> {anim, pivot, axis, speed}; written to anim.json
+ANIM = {}  # asset -> part -> {anim, pivot, axis, speed, dist, angle, period, phase}; anim.json
+MARKS = {}  # asset -> name -> {pos, dir}; markers.json
+LIGHTS = {}  # asset -> name -> light; lights.json
+SIZES = {}  # asset -> (w, d, h) given in @asset(size=...)
 SHOTS = []  # shot() requests, rendered at the end of run()
 
 
-def asset(name):
-    """Декоратор: @asset("HB_Lamp") над функцией f(B), которая вызывает B.add(part, material, bmesh)."""
+def asset(name, size=None):
+    """Декоратор: @asset("HB_Lamp") над функцией f(B), которая вызывает B.add(part, material, bmesh).
+    size=(ширина X, глубина Y, высота Z) из ТЗ: отклонение больше 5 % по любой оси — CHECK ERROR."""
     def wrap(fn):
+        if size:
+            SIZES[name] = tuple(size)
         ASSETS.append((name, fn))
         return fn
     return wrap
@@ -584,6 +775,19 @@ def bounds(objs):
 
 def tris_of(ob):
     return sum(len(p.vertices) - 2 for p in ob.data.polygons)
+
+
+# Real scale (owner 17.11: a 16x6 «store» passed review as a «micro booth»).
+# The Roblox R15 character is ~5.3 studs; doors >= 7.5; a storey 12-14.
+FIGURE_H = 5.3
+FIGURE_MIN = 3.0  # closeups show the figure next to assets at least this big
+SCALE_RULES = (
+    (("Store", "Shop", "Kiosk", "Garage", "Warehouse", "House", "Building"), "z", 11.0,
+     "здание ниже 11 студов: персонаж 5.3, дверь от 7.5, этаж 12–14"),
+    (("Van", "Truck"), "xy", 15.0,
+     "фургон короче 15 студов: при персонаже 5.3 настоящий фургон 17–19"),
+    (("Door",), "z", 7.5, "дверь ниже 7.5 студа: персонаж 5.3 должен проходить"),
+)
 
 
 def check(per_asset):
@@ -619,6 +823,16 @@ def check(per_asset):
                 out.append(("WARN", ob.name, f"{zero} вырожденных граней"))
         if max(size) > 2048:
             out.append(("ERROR", a, "размер > 2048 studs"))
+        if a in SIZES:
+            want = SIZES[a]
+            for i, ax in enumerate("XYZ"):
+                if want[i] and abs(size[i] - want[i]) > want[i] * 0.05:
+                    out.append(("ERROR", a, f"габарит по {ax} {size[i]:.2f}, по ТЗ {want[i]:.2f} (допуск 5 %)"))
+        for keys, axis, least, msg in SCALE_RULES:
+            if any(k in a for k in keys):
+                got = size.z if axis == "z" else max(size.x, size.y)
+                if got < least:
+                    out.append(("WARN", a, f"{msg} (сейчас {got:.1f})"))
     return out
 
 
@@ -719,6 +933,31 @@ def render_preview(per_asset, path):
     bpy.data.collections.remove(st)
 
 
+def _scale_figure(coll):
+    """A plain 5.3-stud person (R15 height) for the closeups: the asset's real scale."""
+    bm = bm_new()
+    for sx in (-0.32, 0.32):
+        cyl(bm, (sx, 0, 0.0), (sx, 0, 2.5), 0.3, 0.26, 10)          # legs
+    box(bm, (0, 0, 3.55), (1.7, 0.85, 2.1), r=0.25)                 # torso
+    for sx in (-1.12, 1.12):
+        cyl(bm, (sx, 0, 4.45), (sx, 0, 2.55), 0.25, 0.22, 10)       # arms
+    ball(bm, (0, 0, FIGURE_H - 0.42), 0.42, 2)                      # head, top at 5.3
+    me = bpy.data.meshes.new("_ScaleFigure")
+    bm.to_mesh(me)
+    bm.free()
+    m = bpy.data.materials.new("_ScaleFigure")
+    m.use_nodes = True
+    b = m.node_tree.nodes.get("Principled BSDF")
+    b.inputs["Base Color"].default_value = (0.9, 0.9, 0.92, 1)
+    b.inputs["Roughness"].default_value = 0.6
+    me.materials.append(m)
+    for poly in me.polygons:
+        poly.use_smooth = True
+    ob = bpy.data.objects.new("_ScaleFigure", me)
+    coll.objects.link(ob)
+    return ob
+
+
 def render_closeups(per_asset, path, cell=560, cols=4):
     """Каждый ассет крупно (вид 3/4 спереди-сверху, ключ + контровой свет) — лист снимков для оценки детализации."""
     scn = bpy.context.scene
@@ -728,7 +967,8 @@ def render_closeups(per_asset, path, cell=560, cols=4):
     scn.render.film_transparent = False
     world = bpy.data.worlds.new("Close")
     world.use_nodes = True
-    world.node_tree.nodes["Background"].inputs["Color"].default_value = (0.16, 0.18, 0.21, 1)
+    bg = (0.36, 0.40, 0.46, 1) if WEAR < 0.3 else (0.16, 0.18, 0.21, 1)  # clean HUB packs: daylight grey
+    world.node_tree.nodes["Background"].inputs["Color"].default_value = bg
     world.node_tree.nodes["Background"].inputs["Strength"].default_value = 0.6
     scn.world = world
     st = bpy.data.collections.new("_Close")
@@ -749,6 +989,7 @@ def render_closeups(per_asset, path, cell=560, cols=4):
     cam = bpy.data.objects.new("CloseCam", cd)
     st.objects.link(cam)
     scn.camera = cam
+    fig = _scale_figure(st)  # a 5.3-stud person beside every asset of 3+ studs
     names = [a for a, _ in ASSETS]
     tiles = []
     for a in names:
@@ -756,6 +997,12 @@ def render_closeups(per_asset, path, cell=560, cols=4):
             for ob in per_asset[b]:
                 ob.hide_render = (b != a) or ("__Collider__" in ob.name)
         lo, hi = bounds([ob for ob in per_asset[a] if "__Collider__" not in ob.name] or per_asset[a])
+        fig.hide_render = max(hi - lo) < FIGURE_MIN
+        if not fig.hide_render:
+            fig.location = (hi.x + 1.4, lo.y - 0.9, 0.0)  # front-right corner, never hidden
+            bpy.context.view_layer.update()
+            flo, fhi = bounds([fig])
+            lo, hi = Vector(map(min, lo, flo)), Vector(map(max, hi, fhi))
         d = Vector((0.55, 1.0, -0.5)).normalized()
         rot = d.to_track_quat("-Z", "Y")
         Rm = rot.to_matrix()
@@ -824,9 +1071,11 @@ def export_fbx(per_asset, pack):
     return files
 
 
-def run(pack, preview=True, textures=True):
-    """Строит всё из @asset, проверяет, экспортирует. pack — имя пакета (V1, V2...)."""
-    global TEX_DIR
+def run(pack, preview=True, textures=True, wear="worn"):
+    """Строит всё из @asset, проверяет, экспортирует. pack — имя пакета (V1, V2...).
+    wear: "clean" (HUB: новое и чистое), "used" (лёгкий износ), "worn" (миссии: грязь, подтёки)."""
+    global TEX_DIR, WEAR
+    WEAR = WEAR_LEVELS.get(wear, 1.0)
     os.makedirs(OUT, exist_ok=True)
     for ob in list(bpy.data.objects):
         bpy.data.objects.remove(ob)
@@ -871,6 +1120,9 @@ def run(pack, preview=True, textures=True):
                      f"mats={','.join(mats)} collider={'yes' if coll else 'no'}")
     for level, who, msg in check(per_asset):
         lines.append(f"CHECK {level} {who}: {msg}")
+    if wear not in WEAR_LEVELS:
+        lines.append(f"CHECK ERROR {pack}: wear={wear!r}, нужно clean, used или worn")
+    lines.append(f"WEAR {wear}")
     for path, n in (export_fbx(per_asset, pack) if per_asset else []):
         lines.append(f"FBX {path} objects={n}")
     if textures and used:
@@ -889,9 +1141,19 @@ def run(pack, preview=True, textures=True):
             for part, info in parts.items():
                 if info["anim"] in ("spin", "swing") and not info["pivot"]:
                     lines.append(f"CHECK ERROR {a}__{part}: anim {info['anim']} needs a pivot")
-                lines.append(f"ANIM {a}__{part} {info['anim']} pivot={info['pivot']} axis={info['axis']}")
+                extra = "".join(f" {k}={info[k]}" for k in ("dist", "angle", "period", "phase") if k in info)
+                lines.append(f"ANIM {a}__{part} {info['anim']} pivot={info['pivot']} axis={info['axis']}{extra}")
         with open(os.path.join(OUT, "anim.json"), "w", encoding="utf-8") as fh:
             json.dump(ANIM, fh, ensure_ascii=False, indent=1)
+    import json as _json
+    for fname, data, tag in (("markers.json", MARKS, "MARK"), ("lights.json", LIGHTS, "LIGHT")):
+        if data:
+            for a, items in data.items():
+                for n, info in items.items():
+                    kind = f" kind={info['kind']}" if "kind" in info else ""
+                    lines.append(f"{tag} {a}.{n} pos={info['pos']}{kind}")
+            with open(os.path.join(OUT, fname), "w", encoding="utf-8") as fh:
+                _json.dump(data, fh, ensure_ascii=False, indent=1)
     for req in SHOTS:
         try:
             lines.append(_render_shot(per_asset, **req))
@@ -1071,4 +1333,5 @@ def png(name, rgba):
 
 __all__ = ["box", "cyl", "ball", "lathe", "torus", "sweep", "prism", "leg", "T", "euler", "bm_new",
            "merge", "xf", "Rng", "asset", "run", "png", "shot", "fbm", "blur", "norm01", "scratches", "specks",
-           "MAT_DEF", "Matrix", "Vector", "math", "np"]
+           "MAT_DEF", "Matrix", "Vector", "math", "np",
+           "rrect", "arcpts", "soften", "displace", "mirror_x", "blur2"]
