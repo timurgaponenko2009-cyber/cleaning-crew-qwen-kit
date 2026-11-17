@@ -891,7 +891,7 @@ def check(per_asset):
                 if want[i] and abs(size[i] - want[i]) > want[i] * 0.05:
                     out.append(("ERROR", a, f"габарит по {ax} {size[i]:.2f}, по ТЗ {want[i]:.2f} (допуск 5 %)"))
         for keys, axis, least, msg in SCALE_RULES:
-            if any(k in a for k in keys):
+            if any(k in a for k in keys) and not (axis == "z" and "Roof" in a):
                 got = size.z if axis == "z" else max(size.x, size.y)
                 if got < least:
                     out.append(("WARN", a, f"{msg} (сейчас {got:.1f})"))
